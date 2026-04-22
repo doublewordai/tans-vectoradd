@@ -1,0 +1,15 @@
+__pycache__/
+*.so
+*.pyc
+build/
+dist/
+*.egg-info/
+.venv/
+
+# Nsight Compute profile dumps
+*.ncu-rep
+ncu_*/
+
+# Ad-hoc edit/revert safety copies
+*.bak
+*.new
