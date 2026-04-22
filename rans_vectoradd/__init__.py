@@ -10,7 +10,6 @@ from rans_vectoradd._C import (
 from rans_vectoradd.codec import (
     BLOCK_STREAMS,
     batch_encode_fp8,
-    pair_freqs_from_single,
     quantize_freqs,
 )
 from rans_vectoradd.data import QWEN3_14B_FP8_EXP, random_fp8_bytes
@@ -22,7 +21,6 @@ __all__ = [
     "fp8_memcpy_digest",
     "gpu_rans_decode_fp8",
     "gpu_rans_decode_fp8_dump",
-    "pair_freqs_from_single",
     "quantize_freqs",
     "random_fp8_bytes",
 ]

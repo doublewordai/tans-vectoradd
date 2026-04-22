@@ -25,13 +25,13 @@ def main() -> None:
     torch.manual_seed(0)
     fp8 = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
 
-    compressed, states, offsets, sm, pair_freqs = batch_encode_fp8(fp8, exp_freqs)
+    compressed, states, offsets, sm = batch_encode_fp8(fp8, exp_freqs)
     comp = compressed.cuda(); off = offsets.cuda()
     st = states.cuda(); sm = sm.cuda()
 
     torch.cuda.synchronize()
     for _ in range(20):
-        gpu_rans_decode_fp8_dump(comp, off, st, sm, N, pair_freqs)
+        gpu_rans_decode_fp8_dump(comp, off, st, sm, N, exp_freqs)
     torch.cuda.synchronize()
 
 

@@ -1,4 +1,4 @@
-// GPU rANS decoder for FP8 E4M3 — block-interleaved compressed layout.
+// GPU rANS decoder for FP8 E4M3 — 16-symbol exponent alphabet.
 //
 // Input layout (matches rans_encode_interleaved):
 //   Block b owns streams [b*128, b*128+128).
@@ -9,13 +9,12 @@
 //   Each stream is right-aligned: a stream with G_s slabs of real data
 //   occupies slabs [G_b - G_s, G_b - 1]. Leading slabs are zero-padded.
 //
-// This gives 100% HBM sector efficiency on compressed reads when all 32
-// lanes of a warp refill at the same slab_idx — a warp of 32 threads
-// reads 32 consecutive uint32s = one coalesced 128-byte transaction.
+// Decode: each iteration produces one exponent nibble (sym in [0,16))
+// and recomposes an FP8 byte with the corresponding sign+mantissa
+// nibble from the packed sm tensor.
 //
-// Symbol alphabet: 256-entry exponent-pair table. Each decode step
-// produces one pair symbol = two exponent nibbles, recomposed with the
-// matching sign+mantissa nibbles to emit two FP8 bytes.
+// Stream radix b = 2^16: renorm pulls 16 bits per step, state lives in
+// [L, bL) = [2^16, 2^32), which fills the uint32.
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAException.h>
@@ -26,7 +25,7 @@ namespace rans_gpu {
 constexpr int      M_LOG         = 11;
 constexpr uint32_t M_SIZE        = 1u << M_LOG;   // 2048
 constexpr uint32_t L_LOW         = 1u << 16;      // 65536
-constexpr int      MAX_ALPHA     = 256;           // exp-pair alphabet
+constexpr int      MAX_ALPHA     = 16;            // exponent nibble alphabet
 constexpr int      BLOCK_STREAMS = 128;           // must match blockDim.x
 }
 
@@ -35,23 +34,21 @@ struct RansCtx {
     int      slab_idx;
     uint32_t buf_hi;        // newer uint16 chunks (MSB consumed first)
     uint32_t buf_lo;        // older uint16 chunks
-    int      buf_avail;     // 0..4 uint16 chunks (= 0..8 bytes)
+    int      buf_avail;     // 0..4 uint16 chunks
     int64_t  block_base_u32;
 };
 
-// Shared decode helper: looks up the next pair symbol from a packed SMEM
-// table, advances rANS state, and pulls renorm bytes as needed.
+// One rANS decode step: read the combined slot→(sym, f, c) entry from
+// SMEM, advance state, pull renorm uint16 chunks as needed.
 //
-// Combined slot→(sym, f, c) packing in sfc_smem:
-//   bits  0..7  : symbol (0..255)
-//   bits  8..19 : frequency f (0..M-1, 12 bits)
-//   bits 20..31 : cumulative offset c (0..M-1, 12 bits)
+// sfc_smem entry packing (uint32 per slot):
+//   bits  0..7  : symbol (0..15 for this alphabet)
+//   bits  8..19 : frequency f (12 bits)
+//   bits 20..31 : cumulative offset c (12 bits)
 //
-// Renorm: with b=2^16 the state grows by 16 bits per refill step, so each
-// decode step does at most 1 renorm iteration (compared to up to 2 at
-// b=2^8). Buffer holds 4 uint16 chunks (8 bytes); when empty we load 2
-// uint32s from consecutive slabs, same coalescing story as before but
-// the refill happens ~half as often per lane.
+// Renorm refill: when buf is empty, load TWO uint32s (= 4 uint16 chunks)
+// from consecutive slabs. Halves refill frequency vs 1-slab-at-a-time,
+// which reduces per-lane divergence for global-memory coalescing.
 __device__ __forceinline__ uint8_t decode_step(
     RansCtx& ctx,
     const uint32_t* sfc_smem,
@@ -72,11 +69,9 @@ __device__ __forceinline__ uint8_t decode_step(
                 + (int64_t)ctx.slab_idx * blockDim.x + tid_in_block;
             ctx.buf_lo = compressed_u32[off];              // older slab
             ctx.buf_hi = compressed_u32[off + blockDim.x]; // newer slab
-            ctx.buf_avail = 4;                             // 4 uint16 chunks
+            ctx.buf_avail = 4;
         }
-        // Consume top uint16 of buf_hi (newest chunk first).
         ctx.x = (ctx.x << 16) | (ctx.buf_hi >> 16);
-        // Shift the 64-bit buffer left by 16 bits.
         ctx.buf_hi = (ctx.buf_hi << 16) | (ctx.buf_lo >> 16);
         ctx.buf_lo <<= 16;
         ctx.buf_avail--;
@@ -87,17 +82,14 @@ __device__ __forceinline__ uint8_t decode_step(
 // Dual-stream kernel: each kernel block covers TWO encoder blocks (256
 // streams). Each thread decodes 2 independent streams; the compiler
 // inlines decode_step and interleaves SMEM loads across streams for ILP.
-// Triple-stream was tried and regressed (fewer kernel blocks → lower wave
-// count → tail-effect dominates at large N). Quad-stream hit register
-// pressure that tanked occupancy. Dual is the right balance on Ada.
 __global__ void rans_decode_fp8_kernel(
     const uint32_t* __restrict__ compressed_u32,
     const int32_t*  __restrict__ block_offsets,
     const uint32_t* __restrict__ final_states,
     const uint32_t* __restrict__ sfc_global,       // [M_SIZE] packed (sym,f,c)
-    const uint8_t*  __restrict__ sign_mantissa,
-    uint8_t*        __restrict__ output,
-    int64_t n_pairs_per_stream,
+    const uint8_t*  __restrict__ sign_mantissa,    // [n_fp8/2, n_streams]
+    uint8_t*        __restrict__ output,           // [n_fp8, n_streams]
+    int64_t n_fp8_per_stream,
     int64_t n_streams)
 {
     __shared__ uint32_t sfc_smem[rans_gpu::M_SIZE];
@@ -143,40 +135,37 @@ __global__ void rans_decode_fp8_kernel(
         B.block_base_u32 = (int64_t)base_bytes_b / 4;
     }
 
-    for (int64_t i = 0; i < n_pairs_per_stream; i++) {
-        uint8_t sym_a = 0, sym_b = 0;
-        if (have_a) sym_a = decode_step(A, sfc_smem, compressed_u32, tid_in_block);
-        if (have_b) sym_b = decode_step(B, sfc_smem, compressed_u32, tid_in_block);
+    // sm_packed holds 2 nibbles per byte (one byte per fp8 pair).
+    // Cache the current byte and select the appropriate nibble each iter.
+    uint8_t sm_byte_a = 0, sm_byte_b = 0;
 
-        uint8_t sma = have_a ? sign_mantissa[i * n_streams + tid_a] : 0;
-        uint8_t smb = have_b ? sign_mantissa[i * n_streams + tid_b] : 0;
+    for (int64_t i = 0; i < n_fp8_per_stream; i++) {
+        if ((i & 1) == 0) {
+            if (have_a) sm_byte_a = sign_mantissa[(i >> 1) * n_streams + tid_a];
+            if (have_b) sm_byte_b = sign_mantissa[(i >> 1) * n_streams + tid_b];
+        }
+        uint8_t exp_a = 0, exp_b = 0;
+        if (have_a) exp_a = decode_step(A, sfc_smem, compressed_u32, tid_in_block);
+        if (have_b) exp_b = decode_step(B, sfc_smem, compressed_u32, tid_in_block);
 
         if (have_a) {
-            uint8_t exp0 = sym_a & 0xF, exp1 = (sym_a >> 4) & 0xF;
-            uint8_t sm0 = sma & 0xF, sm1 = (sma >> 4) & 0xF;
-            uint8_t fp8_0 = ((sm0 & 0x8) << 4) | (exp0 << 3) | (sm0 & 0x7);
-            uint8_t fp8_1 = ((sm1 & 0x8) << 4) | (exp1 << 3) | (sm1 & 0x7);
-            int64_t ob = (int64_t)(2 * i) * n_streams + tid_a;
-            output[ob]             = fp8_0;
-            output[ob + n_streams] = fp8_1;
+            uint8_t sm_nib = (i & 1) ? (sm_byte_a >> 4) : (sm_byte_a & 0xF);
+            uint8_t fp8    = ((sm_nib & 0x8) << 4) | (exp_a << 3) | (sm_nib & 0x7);
+            output[i * n_streams + tid_a] = fp8;
         }
         if (have_b) {
-            uint8_t exp0 = sym_b & 0xF, exp1 = (sym_b >> 4) & 0xF;
-            uint8_t sm0 = smb & 0xF, sm1 = (smb >> 4) & 0xF;
-            uint8_t fp8_0 = ((sm0 & 0x8) << 4) | (exp0 << 3) | (sm0 & 0x7);
-            uint8_t fp8_1 = ((sm1 & 0x8) << 4) | (exp1 << 3) | (sm1 & 0x7);
-            int64_t ob = (int64_t)(2 * i) * n_streams + tid_b;
-            output[ob]             = fp8_0;
-            output[ob + n_streams] = fp8_1;
+            uint8_t sm_nib = (i & 1) ? (sm_byte_b >> 4) : (sm_byte_b & 0xF);
+            uint8_t fp8    = ((sm_nib & 0x8) << 4) | (exp_b << 3) | (sm_nib & 0x7);
+            output[i * n_streams + tid_b] = fp8;
         }
     }
 }
 
-// "Dump" variant: same decode as above, but skips the full-size HBM
-// output write. Folds decoded bytes into a per-thread XOR digest so the
-// compiler can't DCE the decode, and writes one byte per thread (128
-// bytes per block). HBM write is negligible. The returned tensor is a
-// digest, not decoded bytes — this is the throughput-measurement path.
+// Dump variant: same decode work but folds decoded bytes into a
+// per-thread XOR digest instead of writing them back to HBM. For
+// throughput measurement when the downstream consumer lives in SMEM
+// (no HBM write-back scaffolding). Returned tensor is a digest, not
+// decoded bytes.
 __global__ void rans_decode_fp8_dump_kernel(
     const uint32_t* __restrict__ compressed_u32,
     const int32_t*  __restrict__ block_offsets,
@@ -184,7 +173,7 @@ __global__ void rans_decode_fp8_dump_kernel(
     const uint32_t* __restrict__ sfc_global,
     const uint8_t*  __restrict__ sign_mantissa,
     uint8_t*        __restrict__ digest_out,
-    int64_t n_pairs_per_stream,
+    int64_t n_fp8_per_stream,
     int64_t n_streams)
 {
     __shared__ uint32_t sfc_smem[rans_gpu::M_SIZE];
@@ -231,28 +220,26 @@ __global__ void rans_decode_fp8_dump_kernel(
     }
 
     uint8_t digest = 0;
+    uint8_t sm_byte_a = 0, sm_byte_b = 0;
 
-    for (int64_t i = 0; i < n_pairs_per_stream; i++) {
-        uint8_t sym_a = 0, sym_b = 0;
-        if (have_a) sym_a = decode_step(A, sfc_smem, compressed_u32, tid_in_block);
-        if (have_b) sym_b = decode_step(B, sfc_smem, compressed_u32, tid_in_block);
-
-        uint8_t sma = have_a ? sign_mantissa[i * n_streams + tid_a] : 0;
-        uint8_t smb = have_b ? sign_mantissa[i * n_streams + tid_b] : 0;
+    for (int64_t i = 0; i < n_fp8_per_stream; i++) {
+        if ((i & 1) == 0) {
+            if (have_a) sm_byte_a = sign_mantissa[(i >> 1) * n_streams + tid_a];
+            if (have_b) sm_byte_b = sign_mantissa[(i >> 1) * n_streams + tid_b];
+        }
+        uint8_t exp_a = 0, exp_b = 0;
+        if (have_a) exp_a = decode_step(A, sfc_smem, compressed_u32, tid_in_block);
+        if (have_b) exp_b = decode_step(B, sfc_smem, compressed_u32, tid_in_block);
 
         if (have_a) {
-            uint8_t exp0 = sym_a & 0xF, exp1 = (sym_a >> 4) & 0xF;
-            uint8_t sm0 = sma & 0xF, sm1 = (sma >> 4) & 0xF;
-            uint8_t fp8_0 = ((sm0 & 0x8) << 4) | (exp0 << 3) | (sm0 & 0x7);
-            uint8_t fp8_1 = ((sm1 & 0x8) << 4) | (exp1 << 3) | (sm1 & 0x7);
-            digest ^= fp8_0 ^ fp8_1;
+            uint8_t sm_nib = (i & 1) ? (sm_byte_a >> 4) : (sm_byte_a & 0xF);
+            uint8_t fp8    = ((sm_nib & 0x8) << 4) | (exp_a << 3) | (sm_nib & 0x7);
+            digest ^= fp8;
         }
         if (have_b) {
-            uint8_t exp0 = sym_b & 0xF, exp1 = (sym_b >> 4) & 0xF;
-            uint8_t sm0 = smb & 0xF, sm1 = (smb >> 4) & 0xF;
-            uint8_t fp8_0 = ((sm0 & 0x8) << 4) | (exp0 << 3) | (sm0 & 0x7);
-            uint8_t fp8_1 = ((sm1 & 0x8) << 4) | (exp1 << 3) | (sm1 & 0x7);
-            digest ^= fp8_0 ^ fp8_1;
+            uint8_t sm_nib = (i & 1) ? (sm_byte_b >> 4) : (sm_byte_b & 0xF);
+            uint8_t fp8    = ((sm_nib & 0x8) << 4) | (exp_b << 3) | (sm_nib & 0x7);
+            digest ^= fp8;
         }
     }
 
@@ -260,7 +247,6 @@ __global__ void rans_decode_fp8_dump_kernel(
 }
 
 // Shared setup: validate args, build the sfc table on CPU, upload.
-// Returns the GPU sfc tensor (and stashes grid/threads via out params).
 static torch::Tensor build_sfc_table(
     torch::Tensor compressed,
     torch::Tensor block_offsets,
@@ -281,17 +267,16 @@ static torch::Tensor build_sfc_table(
                 "sign_mantissa must be uint8 CUDA");
     TORCH_CHECK(freqs.dtype() == torch::kInt32, "freqs must be int32");
     TORCH_CHECK(n_fp8_per_stream % 2 == 0,
-                "n_fp8_per_stream must be even (one pair-symbol per 2 fp8)");
+                "n_fp8_per_stream must be even (sign+mantissa packing)");
     TORCH_CHECK(compressed.numel() % 4 == 0,
                 "compressed byte length must be a multiple of 4");
 
-    int64_t n_streams    = final_states.numel();
-    int64_t n_pairs      = n_fp8_per_stream / 2;
-    int     n_alphabet   = (int)freqs.numel();
+    int64_t n_streams  = final_states.numel();
+    int     n_alphabet = (int)freqs.numel();
     TORCH_CHECK(n_alphabet > 0 && n_alphabet <= rans_gpu::MAX_ALPHA,
                 "alphabet size must be in [1, ", rans_gpu::MAX_ALPHA, "]");
     TORCH_CHECK(sign_mantissa.dim() == 2
-                && sign_mantissa.size(0) == n_pairs
+                && sign_mantissa.size(0) == n_fp8_per_stream / 2
                 && sign_mantissa.size(1) == n_streams,
                 "sign_mantissa shape must be [n_fp8/2, n_streams]; got ",
                 sign_mantissa.sizes());
@@ -315,8 +300,7 @@ static torch::Tensor build_sfc_table(
     for (int s = 0; s < n_alphabet; s++) {
         uint32_t f = (uint32_t)f_ptr[s];
         uint32_t c = cum_vec[s];
-        TORCH_CHECK(f < 4096u && c < 4096u,
-                    "f and c must fit in 12 bits each");
+        TORCH_CHECK(f < 4096u && c < 4096u, "f and c must fit in 12 bits each");
         uint32_t entry = ((uint32_t)s & 0xFFu)
                        | ((f & 0xFFFu) << 8)
                        | ((c & 0xFFFu) << 20);
@@ -336,15 +320,14 @@ static torch::Tensor build_sfc_table(
     return sfc_cpu.to(compressed.device());
 }
 
-// Returns [n_fp8_per_stream, n_streams] uint8 output on the same device as
-// `compressed`. Use this when you need the decoded bytes.
+// Returns [n_fp8_per_stream, n_streams] uint8 decoded bytes.
 torch::Tensor gpu_rans_decode_fp8(
     torch::Tensor compressed,       // uint8 CUDA
     torch::Tensor block_offsets,    // int32 CUDA [n_enc_blocks + 1]
     torch::Tensor final_states,     // int32 CUDA [n_streams]
     torch::Tensor sign_mantissa,    // uint8 CUDA [n_fp8/2, n_streams]
     int64_t n_fp8_per_stream,
-    torch::Tensor freqs)            // int32 [n_alphabet ≤ 256]
+    torch::Tensor freqs)            // int32 [≤ 16]
 {
     int64_t n_streams, n_enc_blocks;
     auto sfc_gpu = build_sfc_table(compressed, block_offsets, final_states,
@@ -365,17 +348,15 @@ torch::Tensor gpu_rans_decode_fp8(
         reinterpret_cast<const uint32_t*>(sfc_gpu.data_ptr<int32_t>()),
         sign_mantissa.data_ptr<uint8_t>(),
         output.data_ptr<uint8_t>(),
-        n_fp8_per_stream / 2,
+        n_fp8_per_stream,
         n_streams);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
-// Benchmark variant: does the same decode work but folds decoded bytes
-// into a per-thread XOR digest instead of writing them back to HBM.
-// Returns a tiny [blocks * BLOCK_STREAMS] uint8 tensor. Use this to
-// measure the decoder's intrinsic throughput when the downstream
-// consumer lives in SMEM/registers — no scaffolding HBM write.
+// Benchmark variant: identical decode, but emits a per-thread digest
+// instead of the full decoded tensor. See gpu_rans_decode_fp8_dump
+// kernel comment.
 torch::Tensor gpu_rans_decode_fp8_dump(
     torch::Tensor compressed,
     torch::Tensor block_offsets,
@@ -403,7 +384,7 @@ torch::Tensor gpu_rans_decode_fp8_dump(
         reinterpret_cast<const uint32_t*>(sfc_gpu.data_ptr<int32_t>()),
         sign_mantissa.data_ptr<uint8_t>(),
         digest.data_ptr<uint8_t>(),
-        n_fp8_per_stream / 2,
+        n_fp8_per_stream,
         n_streams);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return digest;

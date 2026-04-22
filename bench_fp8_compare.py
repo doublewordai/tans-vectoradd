@@ -31,9 +31,7 @@ PEAK_GBPS = 1008.0
 def bench_compressed(K: int, N: int, fp8_cpu: torch.Tensor) -> dict:
     probs = np.array(QWEN3_14B_FP8_EXP, dtype=np.float64)
     exp_freqs = quantize_freqs(probs)
-    compressed, states, block_offsets, sm_packed, pair_freqs = batch_encode_fp8(
-        fp8_cpu, exp_freqs
-    )
+    compressed, states, block_offsets, sm_packed = batch_encode_fp8(fp8_cpu, exp_freqs)
 
     comp = compressed.cuda()
     off  = block_offsets.cuda()
@@ -41,7 +39,7 @@ def bench_compressed(K: int, N: int, fp8_cpu: torch.Tensor) -> dict:
     sm   = sm_packed.cuda()
 
     def _run():
-        gpu_rans_decode_fp8_dump(comp, off, st, sm, N, pair_freqs)
+        gpu_rans_decode_fp8_dump(comp, off, st, sm, N, exp_freqs)
 
     for _ in range(3):
         _run()

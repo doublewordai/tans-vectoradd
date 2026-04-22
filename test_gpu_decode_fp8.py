@@ -23,9 +23,7 @@ def run_case(K: int, N: int, seed: int = 42) -> None:
     fp8 = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
 
     t0 = time.perf_counter()
-    compressed, states, block_offsets, sm_packed, pair_freqs = batch_encode_fp8(
-        fp8, exp_freqs
-    )
+    compressed, states, block_offsets, sm_packed = batch_encode_fp8(fp8, exp_freqs)
     t_enc = time.perf_counter() - t0
 
     compressed_gpu = compressed.cuda()
@@ -36,7 +34,7 @@ def run_case(K: int, N: int, seed: int = 42) -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     decoded_gpu = gpu_rans_decode_fp8(
-        compressed_gpu, offsets_gpu, states_gpu, sm_gpu, N, pair_freqs
+        compressed_gpu, offsets_gpu, states_gpu, sm_gpu, N, exp_freqs
     )
     torch.cuda.synchronize()
     t_dec = time.perf_counter() - t0
