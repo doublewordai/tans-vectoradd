@@ -20,7 +20,9 @@ import torch
 from rans_vectoradd._C import rans_encode_interleaved as _cpu_encode_interleaved
 
 
-M = 2048                # must match rans_codec.cpp / rans_decode.cu
+M = 2048                # single-nibble default
+M_PAIR = 4096           # pair-alphabet (256 symbols need finer quantization)
+M_TRIPLE = 1024         # factored triple: M^3 = 2^30, fits in uint32 encoder
 BLOCK_STREAMS = 128     # must match rans_decode.cu's BLOCK_STREAMS
 
 
@@ -86,3 +88,89 @@ def batch_encode_fp8(
         exp_nibbles.contiguous(), exp_freqs, block_streams
     )
     return compressed, states, block_offsets, sm_packed
+
+
+def batch_encode_fp8_pairs(
+    fp8_bytes: torch.Tensor,   # [K, N] uint8, FP8 E4M3
+    exp_freqs: torch.Tensor,   # [16] int32 (single-nibble freqs, sum to M)
+    block_streams: int = BLOCK_STREAMS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pair-alphabet encoder: encodes two consecutive exponent nibbles as a
+    single 256-symbol rANS symbol with M=4096. Halves decode steps.
+
+    Returns (compressed, final_states, block_offsets, sign_mantissa_packed,
+    pair_freqs). The pair_freqs must be passed to the pair decoder.
+    """
+    assert fp8_bytes.dim() == 2 and fp8_bytes.dtype == torch.uint8
+    K, N = fp8_bytes.shape
+    assert N % 2 == 0
+
+    exp_nibbles = (fp8_bytes >> 3) & 0xF
+    sm_nibbles  = ((fp8_bytes >> 4) & 0x8) | (fp8_bytes & 0x7)
+
+    # Sign+mantissa packing (identical to single-nibble)
+    sm_pairs     = sm_nibbles.view(K, N // 2, 2)
+    sm_packed_kn = sm_pairs[..., 0] | (sm_pairs[..., 1] << 4)
+    sm_packed    = sm_packed_kn.t().contiguous()
+
+    # Pair symbols: consecutive exponent nibbles → single 0-255 symbol
+    exp_pairs = exp_nibbles.view(K, N // 2, 2)
+    pair_syms = (exp_pairs[..., 0] * 16 + exp_pairs[..., 1]).to(torch.uint8)
+
+    # Pair frequencies: outer product of single-nibble distribution, M=4096
+    probs = exp_freqs.float()
+    probs = probs / probs.sum()
+    pair_probs = (probs.unsqueeze(1) * probs.unsqueeze(0)).flatten().numpy()
+    pair_freqs = quantize_freqs(pair_probs, M=M_PAIR)
+
+    compressed, states, block_offsets = _cpu_encode_interleaved(
+        pair_syms.contiguous(), pair_freqs, block_streams
+    )
+    return compressed, states, block_offsets, sm_packed, pair_freqs
+
+
+def batch_encode_fp8_triples(
+    fp8_bytes: torch.Tensor,   # [K, N] uint8, FP8 E4M3
+    exp_freqs: torch.Tensor,   # [16] int32 (single-nibble freqs, sum to M)
+    block_streams: int = BLOCK_STREAMS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Factored triple encoder: encodes 3 consecutive exponent nibbles as one
+    4096-symbol rANS symbol with M_total = M_TRIPLE^3 = 2^30. The joint
+    frequency is the exact product of marginals — no requantization needed.
+
+    N must be divisible by 3. Returns (compressed, final_states, block_offsets,
+    sign_mantissa_packed, triple_freqs). sign_mantissa is packed in pairs as
+    usual (N/2 bytes per stream); the decoder handles the 3-vs-2 mismatch.
+    """
+    assert fp8_bytes.dim() == 2 and fp8_bytes.dtype == torch.uint8
+    K, N = fp8_bytes.shape
+    assert N % 6 == 0, "N must be divisible by 6 (LCM of 3 and 2 for sm packing)"
+
+    exp_nibbles = (fp8_bytes >> 3) & 0xF
+    sm_nibbles  = ((fp8_bytes >> 4) & 0x8) | (fp8_bytes & 0x7)
+
+    # Sign+mantissa packed in pairs (same as always)
+    sm_pairs     = sm_nibbles.view(K, N // 2, 2)
+    sm_packed_kn = sm_pairs[..., 0] | (sm_pairs[..., 1] << 4)
+    sm_packed    = sm_packed_kn.t().contiguous()
+
+    # Triple symbols: 3 consecutive nibbles → single 0-4095 symbol
+    exp_trips = exp_nibbles.view(K, N // 3, 3)
+    triple_syms = (exp_trips[..., 0].int() * 256
+                   + exp_trips[..., 1].int() * 16
+                   + exp_trips[..., 2].int()).to(torch.int16)  # [K, N/3]
+
+    # Triple frequencies: exact product of marginals, sums to M^3
+    nib_freqs = quantize_freqs(
+        (exp_freqs.float() / exp_freqs.float().sum()).numpy(), M=M_TRIPLE
+    )
+    nf = nib_freqs.numpy().astype(np.int64)
+    # 3-way outer product → [16, 16, 16] → [4096]
+    triple_f = (nf[:, None, None] * nf[None, :, None] * nf[None, None, :]).flatten()
+    triple_freqs = torch.from_numpy(triple_f.astype(np.int32))
+    assert triple_freqs.sum().item() == M_TRIPLE ** 3
+
+    compressed, states, block_offsets = _cpu_encode_interleaved(
+        triple_syms.contiguous(), triple_freqs, block_streams
+    )
+    return compressed, states, block_offsets, sm_packed, nib_freqs

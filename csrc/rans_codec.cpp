@@ -26,41 +26,32 @@
 
 namespace rans {
 
-constexpr int M_LOG = 11;
-constexpr uint32_t M_SIZE = 1u << M_LOG;   // 2048
 constexpr uint32_t L_LOW  = 1u << 16;      // 65536
-// Renormalization threshold: for state x and symbol freq f, we must have
-// x < bL*f/M before the encode step. bL = 2^32, so threshold = f << (32 - M_LOG).
-// Max threshold with f < 2^11 is (2^11 - 1) << 21 = 2^32 - 2^21, still fits in uint32.
-constexpr int RENORM_SHIFT = 32 - M_LOG;
 
-// Encode one stream. Caller supplies precomputed cumulative freqs (shared
-// across streams in a batch). Returns (final_state, byte stream).
+// Encode one stream. Templated on symbol type to handle alphabets > 256.
+template <typename SymT>
 static std::tuple<uint32_t, std::vector<uint8_t>>
-encode_with_cum(const uint8_t* symbols, int64_t n,
-                const uint32_t* freqs, const uint32_t* cum)
+encode_with_cum(const SymT* symbols, int64_t n,
+                const uint32_t* freqs, const uint32_t* cum,
+                uint32_t M, int renorm_shift)
 {
     uint32_t x = L_LOW;
     std::vector<uint8_t> stream;
     stream.reserve(static_cast<size_t>(n) + 16);
 
     for (int64_t i = n - 1; i >= 0; i--) {
-        uint8_t s = symbols[i];
+        int s = (int)symbols[i];
         uint32_t f = freqs[s];
         uint32_t c = cum[s];
 
-        uint32_t thresh = f << RENORM_SHIFT;
+        uint32_t thresh = f << renorm_shift;
         while (x >= thresh) {
-            // Spill one uint16 chunk as two bytes (low, high) so that a
-            // little-endian uint32 load at decode time places two
-            // consecutive chunks at bits [0..15] (older) and [16..31]
-            // (newer). Decoder consumes MSB uint16 first — LIFO order.
             stream.push_back(static_cast<uint8_t>(x & 0xFF));
             stream.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
             x >>= 16;
         }
 
-        x = (x / f) * M_SIZE + c + (x % f);
+        x = (x / f) * M + c + (x % f);
     }
 
     return {x, std::move(stream)};
@@ -80,7 +71,8 @@ rans_encode_interleaved(torch::Tensor symbols, torch::Tensor freqs,
                         int64_t block_streams)
 {
     TORCH_CHECK(symbols.dim() == 2, "symbols must be [K, N]");
-    TORCH_CHECK(symbols.dtype() == torch::kUInt8, "symbols must be uint8");
+    TORCH_CHECK(symbols.dtype() == torch::kUInt8 || symbols.dtype() == torch::kInt16,
+                "symbols must be uint8 or int16");
     TORCH_CHECK(freqs.dtype() == torch::kInt32, "freqs must be int32");
     TORCH_CHECK(symbols.is_contiguous() && symbols.is_cpu(),
                 "symbols must be contiguous CPU");
@@ -93,9 +85,9 @@ rans_encode_interleaved(torch::Tensor symbols, torch::Tensor freqs,
     int64_t n_syms = freqs.numel();
     int64_t n_blocks = (K + block_streams - 1) / block_streams;
 
-    const uint8_t* syms_base = symbols.data_ptr<uint8_t>();
     const int32_t* f_ptr = freqs.data_ptr<int32_t>();
     const uint32_t* f_u32 = reinterpret_cast<const uint32_t*>(f_ptr);
+    bool use_int16 = (symbols.dtype() == torch::kInt16);
 
     std::vector<uint32_t> cum_vec(n_syms);
     uint32_t acc = 0;
@@ -104,8 +96,12 @@ rans_encode_interleaved(torch::Tensor symbols, torch::Tensor freqs,
         cum_vec[i] = acc;
         acc += (uint32_t)f_ptr[i];
     }
-    TORCH_CHECK(acc == rans::M_SIZE,
-                "frequencies must sum to ", rans::M_SIZE, "; got ", acc);
+    uint32_t M = acc;
+    TORCH_CHECK(M > 0 && (M & (M - 1)) == 0,
+                "frequencies must sum to a power of 2; got ", M);
+    int m_log = 0;
+    { uint32_t tmp = M; while (tmp > 1) { m_log++; tmp >>= 1; } }
+    int renorm_shift = 32 - m_log;
 
     // Phase 1: per-stream encode. Streams are fully independent, so we
     // parallelize across CPU cores via OpenMP.
@@ -115,8 +111,17 @@ rans_encode_interleaved(torch::Tensor symbols, torch::Tensor freqs,
 
     #pragma omp parallel for schedule(static)
     for (int64_t k = 0; k < K; k++) {
-        auto result = rans::encode_with_cum(
-            syms_base + k * N, N, f_u32, cum_vec.data());
+        auto encode_stream = [&]() {
+            if (use_int16)
+                return rans::encode_with_cum(
+                    symbols.data_ptr<int16_t>() + k * N, N,
+                    f_u32, cum_vec.data(), M, renorm_shift);
+            else
+                return rans::encode_with_cum(
+                    symbols.data_ptr<uint8_t>() + k * N, N,
+                    f_u32, cum_vec.data(), M, renorm_shift);
+        };
+        auto result = encode_stream();
         states_vec[k]    = (int32_t)std::get<0>(result);
         streams[k]       = std::move(std::get<1>(result));
         int64_t raw_len  = (int64_t)streams[k].size();

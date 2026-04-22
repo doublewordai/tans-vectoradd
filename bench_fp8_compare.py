@@ -20,7 +20,15 @@ import triton.testing
 from rans_vectoradd import (
     QWEN3_14B_FP8_EXP,
     batch_encode_fp8,
+    batch_encode_fp8_pairs,
     gpu_rans_decode_fp8_dump,
+    gpu_rans_decode_fp8_ldg_dump,
+    gpu_rans_decode_fp8_pair_bl_dump,
+    gpu_rans_decode_fp8_pair_ldg_dump,
+    gpu_rans_decode_fp8_triple_dump,
+    batch_encode_fp8_triples,
+    gpu_rans_decode_fp8_pair_ldg_q4_dump,
+    gpu_rans_decode_fp8_regscan_dump,
     quantize_freqs,
     random_fp8_bytes,
 )
@@ -28,10 +36,18 @@ from rans_vectoradd import (
 PEAK_GBPS = 1008.0
 
 
-def bench_compressed(K: int, N: int, fp8_cpu: torch.Tensor) -> dict:
+def bench_decoder(kernel, K: int, N: int, fp8_cpu: torch.Tensor,
+                  encoder=None) -> dict:
     probs = np.array(QWEN3_14B_FP8_EXP, dtype=np.float64)
     exp_freqs = quantize_freqs(probs)
-    compressed, states, block_offsets, sm_packed = batch_encode_fp8(fp8_cpu, exp_freqs)
+    encode = encoder or batch_encode_fp8
+    result = encode(fp8_cpu, exp_freqs)
+    # Pair encoder returns 5 values (includes pair_freqs); single returns 4.
+    if len(result) == 5:
+        compressed, states, block_offsets, sm_packed, dec_freqs = result
+    else:
+        compressed, states, block_offsets, sm_packed = result
+        dec_freqs = exp_freqs
 
     comp = compressed.cuda()
     off  = block_offsets.cuda()
@@ -39,7 +55,7 @@ def bench_compressed(K: int, N: int, fp8_cpu: torch.Tensor) -> dict:
     sm   = sm_packed.cuda()
 
     def _run():
-        gpu_rans_decode_fp8_dump(comp, off, st, sm, N, exp_freqs)
+        kernel(comp, off, st, sm, N, dec_freqs)
 
     for _ in range(3):
         _run()
@@ -115,12 +131,28 @@ def main() -> None:
         K = bytes_out // N
         torch.manual_seed(42)
         fp8 = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
-        r_dec = bench_compressed(K, N, fp8)
+        for name, kernel, enc in (
+            ("exact",    gpu_rans_decode_fp8_dump,         None),
+            ("ldg",      gpu_rans_decode_fp8_ldg_dump,     None),
+            ("pair-ldg", gpu_rans_decode_fp8_pair_ldg_dump, batch_encode_fp8_pairs),
+            ("pair-bl",  gpu_rans_decode_fp8_pair_bl_dump, batch_encode_fp8_pairs),
+        ):
+            r_dec = bench_decoder(kernel, K, N, fp8, encoder=enc)
+            beat = r_dec["Gfp8/s"] / r_cpy["Gfp8/s"]
+            print(fmt(f"rans N={N:<4} {name}", r_dec) +
+                  f"  vs cpy {beat:.2f}x")
+        print()
+
+    # Factored triple: N must be divisible by 6
+    for N in (126, 252, 504):
+        K = bytes_out // N
+        torch.manual_seed(42)
+        fp8 = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
+        r_dec = bench_decoder(gpu_rans_decode_fp8_triple_dump, K, N, fp8,
+                              encoder=batch_encode_fp8_triples)
         beat = r_dec["Gfp8/s"] / r_cpy["Gfp8/s"]
-        ceiling = r_cpy["HBM read GB/s"] * r_dec["fp8/HBM-byte"]
-        note = (f"vs cpy {beat:.2f}x, HBM-bound ceil {ceiling:.0f} "
-                f"({ceiling/r_cpy['Gfp8/s']:.2f}x cpy)")
-        print(fmt(f"rans-decode N={N}", r_dec) + "  " + note)
+        print(fmt(f"rans N={N:<4} triple", r_dec) +
+              f"  vs cpy {beat:.2f}x")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ from rans_vectoradd import (
     QWEN3_14B_FP8_EXP,
     batch_encode_fp8,
     gpu_rans_decode_fp8,
+    gpu_rans_decode_fp8_ldg,
+    gpu_rans_decode_fp8_regscan,
     quantize_freqs,
     random_fp8_bytes,
 )
@@ -31,34 +33,35 @@ def run_case(K: int, N: int, seed: int = 42) -> None:
     offsets_gpu    = block_offsets.cuda()
     sm_gpu         = sm_packed.cuda()
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    decoded_gpu = gpu_rans_decode_fp8(
-        compressed_gpu, offsets_gpu, states_gpu, sm_gpu, N, exp_freqs
-    )
-    torch.cuda.synchronize()
-    t_dec = time.perf_counter() - t0
-
-    # Kernel writes [N, K]; transpose to [K, N] to compare against source.
-    decoded = decoded_gpu.cpu().t().contiguous()
-    ok = torch.equal(decoded, fp8)
-
     comp_bytes = int(compressed.numel())
     sm_bytes   = int(sm_packed.numel())
     bits_per_fp8 = (comp_bytes + sm_bytes) * 8 / (K * N)
 
-    status = "✓" if ok else "FAIL"
-    print(
-        f"K={K:>7} N={N:>5}  {status}  "
-        f"comp={comp_bytes:>11,}B  sm={sm_bytes:>11,}B  "
-        f"bits/fp8={bits_per_fp8:.3f}  "
-        f"enc={t_enc * 1000:>7.1f}ms  dec_gpu={t_dec * 1000:>6.2f}ms"
-    )
-
-    if not ok:
-        diff = (decoded != fp8).any(dim=1).nonzero().flatten()[:5]
-        print(f"  first mismatching rows: {diff.tolist()}")
-        raise SystemExit(1)
+    for label, kernel in (
+        ("exact",   gpu_rans_decode_fp8),
+        ("ldg",     gpu_rans_decode_fp8_ldg),
+        ("regscan", gpu_rans_decode_fp8_regscan),
+    ):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        decoded_gpu = kernel(
+            compressed_gpu, offsets_gpu, states_gpu, sm_gpu, N, exp_freqs
+        )
+        torch.cuda.synchronize()
+        t_dec = time.perf_counter() - t0
+        decoded = decoded_gpu.cpu().t().contiguous()
+        ok = torch.equal(decoded, fp8)
+        status = "✓" if ok else "FAIL"
+        print(
+            f"K={K:>7} N={N:>5}  {label:7s} {status}  "
+            f"comp={comp_bytes:>11,}B  sm={sm_bytes:>11,}B  "
+            f"bits/fp8={bits_per_fp8:.3f}  "
+            f"enc={t_enc * 1000:>6.1f}ms  dec_gpu={t_dec * 1000:>6.2f}ms"
+        )
+        if not ok:
+            diff = (decoded != fp8).any(dim=1).nonzero().flatten()[:5]
+            print(f"  first mismatching rows: {diff.tolist()}")
+            raise SystemExit(1)
 
 
 def main() -> None:

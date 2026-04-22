@@ -64,6 +64,42 @@ torch::Tensor gpu_rans_decode_fp8(
 torch::Tensor gpu_rans_decode_fp8_dump(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_ldg(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_ldg_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_pair_ldg(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_pair_ldg_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_triple(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_triple_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_pair_bl(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_pair_bl_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_pair_ldg_q4(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_pair_ldg_q4_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_regscan(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_regscan_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rans_encode_interleaved", &rans_encode_interleaved,
@@ -78,6 +114,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Benchmark variant of gpu_rans_decode_fp8: folds decoded bytes "
           "into a per-thread XOR digest (tiny HBM write), for measuring "
           "throughput when the downstream consumer lives in SMEM.");
+    m.def("gpu_rans_decode_fp8_ldg", &gpu_rans_decode_fp8_ldg,
+          "L1-cache decoder: same sfc table as exact, but read via __ldg "
+          "through L1 instead of SMEM. Returns [n_fp8_per_stream, n_streams].");
+    m.def("gpu_rans_decode_fp8_ldg_dump", &gpu_rans_decode_fp8_ldg_dump,
+          "Bench-only dump variant of gpu_rans_decode_fp8_ldg.");
+    m.def("gpu_rans_decode_fp8_pair_ldg", &gpu_rans_decode_fp8_pair_ldg,
+          "Pair-alphabet decoder: 256-symbol M=4096, two nibbles per step, "
+          "__ldg through L1. Returns [n_fp8_per_stream, n_streams] uint8.");
+    m.def("gpu_rans_decode_fp8_pair_ldg_dump", &gpu_rans_decode_fp8_pair_ldg_dump,
+          "Bench-only dump variant of gpu_rans_decode_fp8_pair_ldg.");
+    m.def("gpu_rans_decode_fp8_triple", &gpu_rans_decode_fp8_triple,
+          "Factored triple decoder: 3 parallel L1 reads from M=1024 marginal "
+          "table. Returns [n_fp8, n_streams] uint8.");
+    m.def("gpu_rans_decode_fp8_triple_dump", &gpu_rans_decode_fp8_triple_dump,
+          "Bench-only dump variant of factored triple decoder.");
+    m.def("gpu_rans_decode_fp8_pair_bl", &gpu_rans_decode_fp8_pair_bl,
+          "Branchless-renorm pair decoder. Returns [n_fp8, n_streams] uint8.");
+    m.def("gpu_rans_decode_fp8_pair_bl_dump", &gpu_rans_decode_fp8_pair_bl_dump,
+          "Bench-only dump variant of branchless-renorm pair decoder.");
+    m.def("gpu_rans_decode_fp8_pair_ldg_q4", &gpu_rans_decode_fp8_pair_ldg_q4,
+          "Quad-stream pair decoder: 4 streams/thread for more ILP.");
+    m.def("gpu_rans_decode_fp8_pair_ldg_q4_dump", &gpu_rans_decode_fp8_pair_ldg_q4_dump,
+          "Bench-only dump variant of quad-stream pair decoder.");
+    m.def("gpu_rans_decode_fp8_regscan", &gpu_rans_decode_fp8_regscan,
+          "Register-scan decoder: replaces the 8 KB sfc SMEM table with a "
+          "17-entry cum table in registers. Branchless linear scan, zero "
+          "SMEM bank conflicts. Returns [n_fp8_per_stream, n_streams] uint8.");
+    m.def("gpu_rans_decode_fp8_regscan_dump", &gpu_rans_decode_fp8_regscan_dump,
+          "Bench-only dump variant of gpu_rans_decode_fp8_regscan.");
     m.def("fp8_memcpy_digest", &fp8_memcpy_digest,
           "HBM-read-only memcpy reference: fold N fp8 bytes into a "
           "per-thread XOR digest. Apples-to-apples baseline for "
