@@ -26,6 +26,7 @@ from rans_vectoradd.codec import (
     batch_encode_fp8_triples,
     quantize_freqs,
 )
+from rans_vectoradd.codec import M_TRIPLE  # noqa: F401
 from rans_vectoradd.data import QWEN3_14B_FP8_EXP, random_fp8_bytes
 
 __all__ = [
@@ -43,6 +44,8 @@ __all__ = [
     "gpu_rans_decode_fp8_triple",
     "gpu_rans_decode_fp8_triple_dump",
     "batch_encode_fp8_triples",
+    "gpu_rans_decode_fp8_triple",
+    "gpu_rans_decode_fp8_triple_dump",
     "gpu_rans_decode_fp8_pair_ldg",
     "gpu_rans_decode_fp8_pair_ldg_dump",
     "gpu_rans_decode_fp8_pair_ldg_q4",

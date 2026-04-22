@@ -25,8 +25,6 @@ from rans_vectoradd import (
     gpu_rans_decode_fp8_ldg_dump,
     gpu_rans_decode_fp8_pair_bl_dump,
     gpu_rans_decode_fp8_pair_ldg_dump,
-    gpu_rans_decode_fp8_triple_dump,
-    batch_encode_fp8_triples,
     gpu_rans_decode_fp8_pair_ldg_q4_dump,
     gpu_rans_decode_fp8_regscan_dump,
     quantize_freqs,
@@ -143,16 +141,6 @@ def main() -> None:
                   f"  vs cpy {beat:.2f}x")
         print()
 
-    # Factored triple: N must be divisible by 6
-    for N in (126, 252, 504):
-        K = bytes_out // N
-        torch.manual_seed(42)
-        fp8 = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
-        r_dec = bench_decoder(gpu_rans_decode_fp8_triple_dump, K, N, fp8,
-                              encoder=batch_encode_fp8_triples)
-        beat = r_dec["Gfp8/s"] / r_cpy["Gfp8/s"]
-        print(fmt(f"rans N={N:<4} triple", r_dec) +
-              f"  vs cpy {beat:.2f}x")
 
 
 if __name__ == "__main__":

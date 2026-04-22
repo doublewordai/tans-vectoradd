@@ -1608,35 +1608,38 @@ torch::Tensor gpu_rans_decode_fp8_pair_bl_dump(
     return digest;
 }
 
-// ─── Factored triple decode (M=1024, n=3, M_total=2^30) ─────────────
+// ─── Joint triple decode (explicit M-entry table, uint64 entries) ────
 //
-// Exploits the factored joint distribution: p(a,b,c) = p(a)×p(b)×p(c).
-// Instead of one lookup in a huge M^3-entry table, decomposes the slot
-// into 3 base-M digits and does 3 PARALLEL lookups in the same 1024-entry
-// marginal table. The L1 pipeline sees 3 independent reads per step.
+// Extension of pair alphabet to triples: 16^3 = 4096 joint symbols.
+// Each decode step produces 3 exponent nibbles. Table has M entries
+// (M=8192 default), each a uint64 packed as:
+//   bits  0..15 : symbol (0..4095, encodes 3 nibbles)
+//   bits 16..31 : frequency f
+//   bits 32..47 : cumulative c
+//   bits 48..63 : unused
 //
-// Each decode step produces 3 exponent nibbles = 3 fp8 bytes.
-// f_total = f0 × f1 × f2 (exact, no requantization).
-// c_total = c0 × M^2 + c1 × M + c2 (Horner's with shifts since M=2^10).
+// One __ldg read of uint64 per step. L1 latency ~30 cycles for 3 symbols
+// vs ~30 cycles for 2 symbols in pairs → 33% more output per L1 cycle.
 
 namespace rans_gpu_triple {
-constexpr int      M_LOG     = 10;
-constexpr uint32_t M_SIZE    = 1u << M_LOG;        // 1024
-constexpr int      N_LOG     = 3 * M_LOG;           // 30 bits for slot
-constexpr uint32_t L_LOW     = 1u << 16;
+constexpr uint32_t L_LOW         = 1u << 16;
 constexpr int      BLOCK_STREAMS = 128;
 }
 
+// Templated on M_LOG so we can test different M values.
+template <int M_LOG>
 __global__ void rans_decode_fp8_triple_dump_kernel(
     const uint32_t* __restrict__ compressed_u32,
     const int32_t*  __restrict__ block_offsets,
     const uint32_t* __restrict__ final_states,
-    const uint32_t* __restrict__ sfc_global,  // [1024] marginal table
+    const uint64_t* __restrict__ sfc_global,  // [M] uint64 entries
     const uint8_t*  __restrict__ sign_mantissa,
     uint8_t*        __restrict__ digest_out,
     int64_t n_fp8_per_stream,
     int64_t n_streams)
 {
+    constexpr uint32_t M_SIZE = 1u << M_LOG;
+
     int tid = threadIdx.x;
     int enc_a = 2 * blockIdx.x, enc_b = 2 * blockIdx.x + 1;
     int64_t tid_a = (int64_t)enc_a * blockDim.x + tid;
@@ -1665,174 +1668,116 @@ __global__ void rans_decode_fp8_triple_dump_kernel(
 
     for (int64_t i = 0; i < n_triples; i++) {
         // ── Decode stream A ──
-        uint8_t sym_a[3] = {0,0,0};
+        uint16_t sym_a = 0;
         if (have_a) {
-            uint32_t slot = A.x & ((1u << rans_gpu_triple::N_LOG) - 1);
-            // Decompose into 3 base-1024 digits (shifts + masks)
-            uint32_t s0 = (slot >> 20) & (rans_gpu_triple::M_SIZE - 1);
-            uint32_t s1 = (slot >> 10) & (rans_gpu_triple::M_SIZE - 1);
-            uint32_t s2 = slot & (rans_gpu_triple::M_SIZE - 1);
+            uint32_t slot = A.x & (M_SIZE - 1);
+            uint64_t entry = __ldg(&sfc_global[slot]);
+            sym_a    = (uint16_t)(entry & 0xFFFF);
+            uint32_t f = (uint32_t)((entry >> 16) & 0xFFFF);
+            uint32_t c = (uint32_t)((entry >> 32) & 0xFFFF);
+            A.x = (A.x >> M_LOG) * f + (slot - c);
 
-            // 3 parallel L1 reads from the same 4KB table
-            uint32_t e0 = __ldg(&sfc_global[s0]);
-            uint32_t e1 = __ldg(&sfc_global[s1]);
-            uint32_t e2 = __ldg(&sfc_global[s2]);
-
-            sym_a[0] = e0 & 0xFF;
-            sym_a[1] = e1 & 0xFF;
-            sym_a[2] = e2 & 0xFF;
-            uint32_t f0 = (e0 >> 8) & 0x3FF;  // 10-bit freq for M=1024
-            uint32_t f1 = (e1 >> 8) & 0x3FF;
-            uint32_t f2 = (e2 >> 8) & 0x3FF;
-            uint32_t c0 = (e0 >> 18) & 0x3FF;  // 10-bit cum
-            uint32_t c1 = (e1 >> 18) & 0x3FF;
-            uint32_t c2 = (e2 >> 18) & 0x3FF;
-
-            uint32_t f_total = f0 * f1 * f2;
-            uint32_t c_total = (c0 << 20) | (c1 << 10) | c2;
-
-            A.x = (A.x >> rans_gpu_triple::N_LOG) * f_total + (slot - c_total);
-
-            // Branchless renorm
-            bool need = (A.x < rans_gpu_triple::L_LOW);
-            if (need && A.buf_avail == 0) {
-                A.slab_idx -= 2;
-                int64_t off = A.block_base_u32
-                    + (int64_t)A.slab_idx * blockDim.x + tid;
-                A.buf_lo = compressed_u32[off];
-                A.buf_hi = compressed_u32[off + blockDim.x];
-                A.buf_avail = 4;
+            // Branchless renorm (may need 2 steps for large M_LOG)
+            for (int r = 0; r < 2; r++) {
+                bool need = (A.x < rans_gpu_triple::L_LOW);
+                if (need && A.buf_avail == 0) {
+                    A.slab_idx -= 2;
+                    int64_t off = A.block_base_u32
+                        + (int64_t)A.slab_idx * blockDim.x + tid;
+                    A.buf_lo = compressed_u32[off];
+                    A.buf_hi = compressed_u32[off + blockDim.x];
+                    A.buf_avail = 4;
+                }
+                uint32_t x_r  = (A.x << 16) | (A.buf_hi >> 16);
+                uint32_t bh_s = (A.buf_hi << 16) | (A.buf_lo >> 16);
+                uint32_t bl_s = A.buf_lo << 16;
+                int      av_d = A.buf_avail - 1;
+                A.x         = need ? x_r  : A.x;
+                A.buf_hi    = need ? bh_s : A.buf_hi;
+                A.buf_lo    = need ? bl_s : A.buf_lo;
+                A.buf_avail = need ? av_d : A.buf_avail;
             }
-            uint32_t x_r  = (A.x << 16) | (A.buf_hi >> 16);
-            uint32_t bh_s = (A.buf_hi << 16) | (A.buf_lo >> 16);
-            uint32_t bl_s = A.buf_lo << 16;
-            int      av_d = A.buf_avail - 1;
-            A.x         = need ? x_r  : A.x;
-            A.buf_hi    = need ? bh_s : A.buf_hi;
-            A.buf_lo    = need ? bl_s : A.buf_lo;
-            A.buf_avail = need ? av_d : A.buf_avail;
-
-            // Might need a second renorm (more likely with 30-bit M_total)
-            need = (A.x < rans_gpu_triple::L_LOW);
-            if (need && A.buf_avail == 0) {
-                A.slab_idx -= 2;
-                int64_t off = A.block_base_u32
-                    + (int64_t)A.slab_idx * blockDim.x + tid;
-                A.buf_lo = compressed_u32[off];
-                A.buf_hi = compressed_u32[off + blockDim.x];
-                A.buf_avail = 4;
-            }
-            x_r  = (A.x << 16) | (A.buf_hi >> 16);
-            bh_s = (A.buf_hi << 16) | (A.buf_lo >> 16);
-            bl_s = A.buf_lo << 16;
-            av_d = A.buf_avail - 1;
-            A.x         = need ? x_r  : A.x;
-            A.buf_hi    = need ? bh_s : A.buf_hi;
-            A.buf_lo    = need ? bl_s : A.buf_lo;
-            A.buf_avail = need ? av_d : A.buf_avail;
         }
 
         // ── Decode stream B ──
-        uint8_t sym_b[3] = {0,0,0};
+        uint16_t sym_b = 0;
         if (have_b) {
-            uint32_t slot = B.x & ((1u << rans_gpu_triple::N_LOG) - 1);
-            uint32_t s0 = (slot >> 20) & (rans_gpu_triple::M_SIZE - 1);
-            uint32_t s1 = (slot >> 10) & (rans_gpu_triple::M_SIZE - 1);
-            uint32_t s2 = slot & (rans_gpu_triple::M_SIZE - 1);
+            uint32_t slot = B.x & (M_SIZE - 1);
+            uint64_t entry = __ldg(&sfc_global[slot]);
+            sym_b    = (uint16_t)(entry & 0xFFFF);
+            uint32_t f = (uint32_t)((entry >> 16) & 0xFFFF);
+            uint32_t c = (uint32_t)((entry >> 32) & 0xFFFF);
+            B.x = (B.x >> M_LOG) * f + (slot - c);
 
-            uint32_t e0 = __ldg(&sfc_global[s0]);
-            uint32_t e1 = __ldg(&sfc_global[s1]);
-            uint32_t e2 = __ldg(&sfc_global[s2]);
-
-            sym_b[0] = e0 & 0xFF;
-            sym_b[1] = e1 & 0xFF;
-            sym_b[2] = e2 & 0xFF;
-            uint32_t f0 = (e0 >> 8) & 0x3FF;
-            uint32_t f1 = (e1 >> 8) & 0x3FF;
-            uint32_t f2 = (e2 >> 8) & 0x3FF;
-            uint32_t c0 = (e0 >> 18) & 0x3FF;
-            uint32_t c1 = (e1 >> 18) & 0x3FF;
-            uint32_t c2 = (e2 >> 18) & 0x3FF;
-
-            uint32_t f_total = f0 * f1 * f2;
-            uint32_t c_total = (c0 << 20) | (c1 << 10) | c2;
-
-            B.x = (B.x >> rans_gpu_triple::N_LOG) * f_total + (slot - c_total);
-
-            bool need = (B.x < rans_gpu_triple::L_LOW);
-            if (need && B.buf_avail == 0) {
-                B.slab_idx -= 2;
-                int64_t off = B.block_base_u32
-                    + (int64_t)B.slab_idx * blockDim.x + tid;
-                B.buf_lo = compressed_u32[off];
-                B.buf_hi = compressed_u32[off + blockDim.x];
-                B.buf_avail = 4;
+            for (int r = 0; r < 2; r++) {
+                bool need = (B.x < rans_gpu_triple::L_LOW);
+                if (need && B.buf_avail == 0) {
+                    B.slab_idx -= 2;
+                    int64_t off = B.block_base_u32
+                        + (int64_t)B.slab_idx * blockDim.x + tid;
+                    B.buf_lo = compressed_u32[off];
+                    B.buf_hi = compressed_u32[off + blockDim.x];
+                    B.buf_avail = 4;
+                }
+                uint32_t x_r  = (B.x << 16) | (B.buf_hi >> 16);
+                uint32_t bh_s = (B.buf_hi << 16) | (B.buf_lo >> 16);
+                uint32_t bl_s = B.buf_lo << 16;
+                int      av_d = B.buf_avail - 1;
+                B.x         = need ? x_r  : B.x;
+                B.buf_hi    = need ? bh_s : B.buf_hi;
+                B.buf_lo    = need ? bl_s : B.buf_lo;
+                B.buf_avail = need ? av_d : B.buf_avail;
             }
-            uint32_t x_r  = (B.x << 16) | (B.buf_hi >> 16);
-            uint32_t bh_s = (B.buf_hi << 16) | (B.buf_lo >> 16);
-            uint32_t bl_s = B.buf_lo << 16;
-            int      av_d = B.buf_avail - 1;
-            B.x         = need ? x_r  : B.x;
-            B.buf_hi    = need ? bh_s : B.buf_hi;
-            B.buf_lo    = need ? bl_s : B.buf_lo;
-            B.buf_avail = need ? av_d : B.buf_avail;
-
-            need = (B.x < rans_gpu_triple::L_LOW);
-            if (need && B.buf_avail == 0) {
-                B.slab_idx -= 2;
-                int64_t off = B.block_base_u32
-                    + (int64_t)B.slab_idx * blockDim.x + tid;
-                B.buf_lo = compressed_u32[off];
-                B.buf_hi = compressed_u32[off + blockDim.x];
-                B.buf_avail = 4;
-            }
-            x_r  = (B.x << 16) | (B.buf_hi >> 16);
-            bh_s = (B.buf_hi << 16) | (B.buf_lo >> 16);
-            bl_s = B.buf_lo << 16;
-            av_d = B.buf_avail - 1;
-            B.x         = need ? x_r  : B.x;
-            B.buf_hi    = need ? bh_s : B.buf_hi;
-            B.buf_lo    = need ? bl_s : B.buf_lo;
-            B.buf_avail = need ? av_d : B.buf_avail;
         }
 
-        // ── Compose 3 fp8 bytes per stream and fold into digest ──
-        // sm is packed in pairs (2 nibbles/byte). For 3 fp8 bytes at
-        // positions 3i, 3i+1, 3i+2: sm byte at 3i/2 and (3i+2)/2.
-        // Since N%6==0, the alignment works out every 2 triple steps.
+        // ── Compose 3 fp8 bytes per stream, fold into digest ──
+        // sym encodes (nib0 * 256 + nib1 * 16 + nib2).
+        // sm is packed in pairs. For 3 fp8 at positions 3i, 3i+1, 3i+2:
+        // sm bytes at indices 3i/2 and (3i+2)/2.
         if (have_a) {
+            uint8_t n0 = (sym_a >> 8) & 0xF;
+            uint8_t n1 = (sym_a >> 4) & 0xF;
+            uint8_t n2 = sym_a & 0xF;
             for (int j = 0; j < 3; j++) {
                 int fp8_idx = 3 * (int)i + j;
                 int sm_pair = fp8_idx / 2;
                 uint8_t sm_byte = sign_mantissa[sm_pair * n_streams + tid_a];
                 uint8_t sm_nib = (fp8_idx & 1) ? (sm_byte >> 4) : (sm_byte & 0xF);
-                digest ^= ((sm_nib & 0x8) << 4) | (sym_a[j] << 3) | (sm_nib & 0x7);
+                uint8_t exp = (j == 0) ? n0 : (j == 1) ? n1 : n2;
+                digest ^= ((sm_nib & 0x8) << 4) | (exp << 3) | (sm_nib & 0x7);
             }
         }
         if (have_b) {
+            uint8_t n0 = (sym_b >> 8) & 0xF;
+            uint8_t n1 = (sym_b >> 4) & 0xF;
+            uint8_t n2 = sym_b & 0xF;
             for (int j = 0; j < 3; j++) {
                 int fp8_idx = 3 * (int)i + j;
                 int sm_pair = fp8_idx / 2;
                 uint8_t sm_byte = sign_mantissa[sm_pair * n_streams + tid_b];
                 uint8_t sm_nib = (fp8_idx & 1) ? (sm_byte >> 4) : (sm_byte & 0xF);
-                digest ^= ((sm_nib & 0x8) << 4) | (sym_b[j] << 3) | (sm_nib & 0x7);
+                uint8_t exp = (j == 0) ? n0 : (j == 1) ? n1 : n2;
+                digest ^= ((sm_nib & 0x8) << 4) | (exp << 3) | (sm_nib & 0x7);
             }
         }
     }
     digest_out[(int64_t)blockIdx.x * blockDim.x + tid] = digest;
 }
 
-// Full-output variant for correctness testing.
+// Full-output variant for correctness.
+template <int M_LOG>
 __global__ void rans_decode_fp8_triple_kernel(
     const uint32_t* __restrict__ compressed_u32,
     const int32_t*  __restrict__ block_offsets,
     const uint32_t* __restrict__ final_states,
-    const uint32_t* __restrict__ sfc_global,
+    const uint64_t* __restrict__ sfc_global,
     const uint8_t*  __restrict__ sign_mantissa,
     uint8_t*        __restrict__ output,
     int64_t n_fp8_per_stream,
     int64_t n_streams)
 {
+    constexpr uint32_t M_SIZE = 1u << M_LOG;
+
     int tid = threadIdx.x;
     int enc_a = 2 * blockIdx.x, enc_b = 2 * blockIdx.x + 1;
     int64_t tid_a = (int64_t)enc_a * blockDim.x + tid;
@@ -1858,137 +1803,121 @@ __global__ void rans_decode_fp8_triple_kernel(
 
     int64_t n_triples = n_fp8_per_stream / 3;
     for (int64_t i = 0; i < n_triples; i++) {
-        // Decode A
-        uint8_t sym_a[3] = {0,0,0};
-        if (have_a) {
-            uint32_t slot = A.x & ((1u << rans_gpu_triple::N_LOG) - 1);
-            uint32_t s0 = (slot >> 20) & 0x3FF, s1 = (slot >> 10) & 0x3FF, s2 = slot & 0x3FF;
-            uint32_t e0 = __ldg(&sfc_global[s0]), e1 = __ldg(&sfc_global[s1]), e2 = __ldg(&sfc_global[s2]);
-            sym_a[0] = e0 & 0xFF; sym_a[1] = e1 & 0xFF; sym_a[2] = e2 & 0xFF;
-            uint32_t f0=(e0>>8)&0x3FF, f1=(e1>>8)&0x3FF, f2=(e2>>8)&0x3FF;
-            uint32_t c0=(e0>>18)&0x3FF, c1=(e1>>18)&0x3FF, c2=(e2>>18)&0x3FF;
-            uint32_t f_total = f0*f1*f2, c_total = (c0<<20)|(c1<<10)|c2;
-            A.x = (A.x >> 30) * f_total + (slot - c_total);
+        uint16_t sym_a = 0, sym_b = 0;
 
-            // Two branchless renorm steps
+        if (have_a) {
+            uint32_t slot = A.x & (M_SIZE - 1);
+            uint64_t entry = __ldg(&sfc_global[slot]);
+            sym_a = (uint16_t)(entry & 0xFFFF);
+            uint32_t f = (uint32_t)((entry >> 16) & 0xFFFF);
+            uint32_t c = (uint32_t)((entry >> 32) & 0xFFFF);
+            A.x = (A.x >> M_LOG) * f + (slot - c);
             for (int r = 0; r < 2; r++) {
                 bool need = (A.x < rans_gpu_triple::L_LOW);
                 if (need && A.buf_avail == 0) {
                     A.slab_idx -= 2;
-                    int64_t off = A.block_base_u32 + (int64_t)A.slab_idx * blockDim.x + tid;
-                    A.buf_lo = compressed_u32[off]; A.buf_hi = compressed_u32[off + blockDim.x];
-                    A.buf_avail = 4;
+                    int64_t off = A.block_base_u32 + (int64_t)A.slab_idx*blockDim.x+tid;
+                    A.buf_lo=compressed_u32[off]; A.buf_hi=compressed_u32[off+blockDim.x];
+                    A.buf_avail=4;
                 }
-                uint32_t x_r = (A.x<<16)|(A.buf_hi>>16);
-                uint32_t bh = (A.buf_hi<<16)|(A.buf_lo>>16);
-                uint32_t bl = A.buf_lo<<16;
-                int av = A.buf_avail-1;
-                A.x = need?x_r:A.x; A.buf_hi = need?bh:A.buf_hi;
-                A.buf_lo = need?bl:A.buf_lo; A.buf_avail = need?av:A.buf_avail;
+                uint32_t xr=(A.x<<16)|(A.buf_hi>>16);
+                uint32_t bh=(A.buf_hi<<16)|(A.buf_lo>>16), bl=A.buf_lo<<16;
+                int av=A.buf_avail-1;
+                A.x=need?xr:A.x; A.buf_hi=need?bh:A.buf_hi;
+                A.buf_lo=need?bl:A.buf_lo; A.buf_avail=need?av:A.buf_avail;
             }
         }
-        // Decode B
-        uint8_t sym_b[3] = {0,0,0};
         if (have_b) {
-            uint32_t slot = B.x & ((1u << rans_gpu_triple::N_LOG) - 1);
-            uint32_t s0 = (slot >> 20) & 0x3FF, s1 = (slot >> 10) & 0x3FF, s2 = slot & 0x3FF;
-            uint32_t e0 = __ldg(&sfc_global[s0]), e1 = __ldg(&sfc_global[s1]), e2 = __ldg(&sfc_global[s2]);
-            sym_b[0] = e0 & 0xFF; sym_b[1] = e1 & 0xFF; sym_b[2] = e2 & 0xFF;
-            uint32_t f0=(e0>>8)&0x3FF, f1=(e1>>8)&0x3FF, f2=(e2>>8)&0x3FF;
-            uint32_t c0=(e0>>18)&0x3FF, c1=(e1>>18)&0x3FF, c2=(e2>>18)&0x3FF;
-            uint32_t f_total = f0*f1*f2, c_total = (c0<<20)|(c1<<10)|c2;
-            B.x = (B.x >> 30) * f_total + (slot - c_total);
+            uint32_t slot = B.x & (M_SIZE - 1);
+            uint64_t entry = __ldg(&sfc_global[slot]);
+            sym_b = (uint16_t)(entry & 0xFFFF);
+            uint32_t f = (uint32_t)((entry >> 16) & 0xFFFF);
+            uint32_t c = (uint32_t)((entry >> 32) & 0xFFFF);
+            B.x = (B.x >> M_LOG) * f + (slot - c);
             for (int r = 0; r < 2; r++) {
                 bool need = (B.x < rans_gpu_triple::L_LOW);
                 if (need && B.buf_avail == 0) {
                     B.slab_idx -= 2;
-                    int64_t off = B.block_base_u32 + (int64_t)B.slab_idx * blockDim.x + tid;
-                    B.buf_lo = compressed_u32[off]; B.buf_hi = compressed_u32[off + blockDim.x];
-                    B.buf_avail = 4;
+                    int64_t off = B.block_base_u32 + (int64_t)B.slab_idx*blockDim.x+tid;
+                    B.buf_lo=compressed_u32[off]; B.buf_hi=compressed_u32[off+blockDim.x];
+                    B.buf_avail=4;
                 }
-                uint32_t x_r = (B.x<<16)|(B.buf_hi>>16);
-                uint32_t bh = (B.buf_hi<<16)|(B.buf_lo>>16);
-                uint32_t bl = B.buf_lo<<16;
-                int av = B.buf_avail-1;
-                B.x = need?x_r:B.x; B.buf_hi = need?bh:B.buf_hi;
-                B.buf_lo = need?bl:B.buf_lo; B.buf_avail = need?av:B.buf_avail;
+                uint32_t xr=(B.x<<16)|(B.buf_hi>>16);
+                uint32_t bh=(B.buf_hi<<16)|(B.buf_lo>>16), bl=B.buf_lo<<16;
+                int av=B.buf_avail-1;
+                B.x=need?xr:B.x; B.buf_hi=need?bh:B.buf_hi;
+                B.buf_lo=need?bl:B.buf_lo; B.buf_avail=need?av:B.buf_avail;
             }
         }
-        // Write 3 fp8 bytes per stream
+
         if (have_a) {
-            for (int j = 0; j < 3; j++) {
-                int fp8_idx = 3*(int)i + j;
-                int sm_pair = fp8_idx / 2;
-                uint8_t sm_byte = sign_mantissa[sm_pair * n_streams + tid_a];
-                uint8_t sm_nib = (fp8_idx & 1) ? (sm_byte >> 4) : (sm_byte & 0xF);
-                output[fp8_idx * n_streams + tid_a] = ((sm_nib&8)<<4)|(sym_a[j]<<3)|(sm_nib&7);
+            uint8_t n0=(sym_a>>8)&0xF, n1=(sym_a>>4)&0xF, n2=sym_a&0xF;
+            for (int j=0;j<3;j++) {
+                int fi=3*(int)i+j, sp=fi/2;
+                uint8_t sb=sign_mantissa[sp*n_streams+tid_a];
+                uint8_t sn=(fi&1)?(sb>>4):(sb&0xF);
+                uint8_t ex=(j==0)?n0:(j==1)?n1:n2;
+                output[fi*n_streams+tid_a]=((sn&8)<<4)|(ex<<3)|(sn&7);
             }
         }
         if (have_b) {
-            for (int j = 0; j < 3; j++) {
-                int fp8_idx = 3*(int)i + j;
-                int sm_pair = fp8_idx / 2;
-                uint8_t sm_byte = sign_mantissa[sm_pair * n_streams + tid_b];
-                uint8_t sm_nib = (fp8_idx & 1) ? (sm_byte >> 4) : (sm_byte & 0xF);
-                output[fp8_idx * n_streams + tid_b] = ((sm_nib&8)<<4)|(sym_b[j]<<3)|(sm_nib&7);
+            uint8_t n0=(sym_b>>8)&0xF, n1=(sym_b>>4)&0xF, n2=sym_b&0xF;
+            for (int j=0;j<3;j++) {
+                int fi=3*(int)i+j, sp=fi/2;
+                uint8_t sb=sign_mantissa[sp*n_streams+tid_b];
+                uint8_t sn=(fi&1)?(sb>>4):(sb&0xF);
+                uint8_t ex=(j==0)?n0:(j==1)?n1:n2;
+                output[fi*n_streams+tid_b]=((sn&8)<<4)|(ex<<3)|(sn&7);
             }
         }
     }
 }
 
-// Host: build 1024-entry sfc table for M=1024 marginal.
-// Packing: sym(8) | f(10) | c(10) = 28 bits in uint32.
-// (Shifted to: sym bits [0:7], f bits [8:17], c bits [18:27])
+// Host: build uint64 sfc table for triple joint alphabet.
 static torch::Tensor build_sfc_table_triple(
-    torch::Tensor freqs,
-    int64_t& n_streams_out,
-    int64_t& n_enc_blocks_out,
-    torch::Tensor compressed,
-    torch::Tensor block_offsets,
-    torch::Tensor final_states,
-    torch::Tensor sign_mantissa,
-    int64_t n_fp8_per_stream)
+    torch::Tensor compressed, torch::Tensor block_offsets,
+    torch::Tensor final_states, torch::Tensor sign_mantissa,
+    int64_t n_fp8_per_stream, torch::Tensor freqs,
+    int64_t M_total,
+    int64_t& n_streams_out, int64_t& n_enc_blocks_out)
 {
     TORCH_CHECK(compressed.is_cuda() && compressed.dtype() == torch::kUInt8);
     TORCH_CHECK(n_fp8_per_stream % 3 == 0);
-    TORCH_CHECK(compressed.numel() % 4 == 0);
     TORCH_CHECK(freqs.dtype() == torch::kInt32);
 
     int64_t n_streams = final_states.numel();
-    int n_alphabet = (int)freqs.numel();
-
-    // freqs are the TRIPLE joint freqs (4096 entries summing to M^3).
-    // But our sfc table is the MARGINAL (16 entries summing to M=1024).
-    // We need the marginal freqs. Extract from the first 16 entries of
-    // the joint by summing: marginal_f[s] = sum_{a,b} joint_f[s*256 + a*16 + b]
-    // = f[s] * M^2 (since joint = product). So marginal_f[s] = joint_f[s*256] / (f[0]*f[1]*...) ...
-    // Actually easier: the caller should pass the marginal freqs separately.
-    // For now, reconstruct: marginal[s] = round(cbrt(sum of joint_f where s is first digit))
-    // This is fragile. Let's just accept marginal freqs directly.
-    TORCH_CHECK(n_alphabet == 16, "triple decoder needs 16-entry marginal freqs");
+    int     n_alphabet = (int)freqs.numel();
+    TORCH_CHECK(n_alphabet <= 4096, "triple alphabet max 4096 symbols");
+    TORCH_CHECK(sign_mantissa.dim() == 2
+                && sign_mantissa.size(0) == n_fp8_per_stream / 2
+                && sign_mantissa.size(1) == n_streams);
 
     auto freqs_cpu = freqs.cpu().contiguous();
     const int32_t* f_ptr = freqs_cpu.data_ptr<int32_t>();
-    uint32_t acc = 0;
-    for (int i = 0; i < 16; i++) acc += (uint32_t)f_ptr[i];
-    TORCH_CHECK(acc == rans_gpu_triple::M_SIZE,
-                "marginal freqs must sum to ", rans_gpu_triple::M_SIZE);
 
-    auto sfc_cpu = torch::zeros({(int64_t)rans_gpu_triple::M_SIZE}, torch::kInt32);
-    auto* sfc_ptr = reinterpret_cast<uint32_t*>(sfc_cpu.data_ptr<int32_t>());
+    uint32_t acc = 0;
+    std::vector<uint32_t> cum_vec(n_alphabet);
+    for (int i = 0; i < n_alphabet; i++) {
+        cum_vec[i] = acc;
+        acc += (uint32_t)f_ptr[i];
+    }
+    TORCH_CHECK((int64_t)acc == M_total,
+                "freqs must sum to M_total=", M_total, "; got ", acc);
+    TORCH_CHECK(M_total <= 65536, "M_total must fit in uint16 for packing");
+
+    // Build uint64 sfc table: [M_total] entries.
+    auto sfc_cpu = torch::zeros({M_total}, torch::kInt64);
+    int64_t* sfc_ptr = sfc_cpu.data_ptr<int64_t>();
     uint32_t pos = 0;
-    std::vector<uint32_t> cum_vec(16);
-    uint32_t cum_acc = 0;
-    for (int s = 0; s < 16; s++) {
-        cum_vec[s] = cum_acc;
+    for (int s = 0; s < n_alphabet; s++) {
         uint32_t f = (uint32_t)f_ptr[s];
-        uint32_t c = cum_acc;
-        uint32_t entry = ((uint32_t)s & 0xFFu)
-                       | ((f & 0x3FFu) << 8)
-                       | ((c & 0x3FFu) << 18);
-        for (uint32_t j = 0; j < f; j++) sfc_ptr[pos + j] = entry;
+        uint32_t c = cum_vec[s];
+        uint64_t entry = ((uint64_t)s & 0xFFFFu)
+                       | (((uint64_t)f & 0xFFFFu) << 16)
+                       | (((uint64_t)c & 0xFFFFu) << 32);
+        for (uint32_t j = 0; j < f; j++)
+            sfc_ptr[pos + j] = (int64_t)entry;
         pos += f;
-        cum_acc += f;
     }
 
     int64_t n_enc_blocks = (n_streams + rans_gpu_triple::BLOCK_STREAMS - 1)
@@ -2004,25 +1933,40 @@ static torch::Tensor build_sfc_table_triple(
 torch::Tensor gpu_rans_decode_fp8_triple(
     torch::Tensor compressed, torch::Tensor block_offsets,
     torch::Tensor final_states, torch::Tensor sign_mantissa,
-    int64_t n_fp8_per_stream, torch::Tensor marginal_freqs)
+    int64_t n_fp8_per_stream, torch::Tensor freqs,
+    int64_t M_total)
 {
     int64_t n_streams, n_enc_blocks;
-    auto sfc_gpu = build_sfc_table_triple(marginal_freqs, n_streams, n_enc_blocks,
-                                          compressed, block_offsets, final_states,
-                                          sign_mantissa, n_fp8_per_stream);
+    auto sfc_gpu = build_sfc_table_triple(compressed, block_offsets, final_states,
+                                          sign_mantissa, n_fp8_per_stream, freqs,
+                                          M_total, n_streams, n_enc_blocks);
     auto output = torch::empty(
         {n_fp8_per_stream, n_streams},
         torch::TensorOptions().dtype(torch::kUInt8).device(compressed.device()));
     const int threads = rans_gpu_triple::BLOCK_STREAMS;
     int64_t blocks = (n_enc_blocks + 1) / 2;
-    rans_decode_fp8_triple_kernel<<<blocks, threads>>>(
-        reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()),
-        block_offsets.data_ptr<int32_t>(),
-        reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()),
-        reinterpret_cast<const uint32_t*>(sfc_gpu.data_ptr<int32_t>()),
-        sign_mantissa.data_ptr<uint8_t>(),
-        output.data_ptr<uint8_t>(),
-        n_fp8_per_stream, n_streams);
+
+    // Dispatch on M_LOG
+    int m_log = 0;
+    { int64_t tmp = M_total; while (tmp > 1) { m_log++; tmp >>= 1; } }
+
+    #define LAUNCH_TRIPLE(ML) \
+        rans_decode_fp8_triple_kernel<ML><<<blocks, threads>>>( \
+            reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()), \
+            block_offsets.data_ptr<int32_t>(), \
+            reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()), \
+            reinterpret_cast<const uint64_t*>(sfc_gpu.data_ptr<int64_t>()), \
+            sign_mantissa.data_ptr<uint8_t>(), \
+            output.data_ptr<uint8_t>(), \
+            n_fp8_per_stream, n_streams)
+
+    switch (m_log) {
+        case 12: LAUNCH_TRIPLE(12); break;
+        case 13: LAUNCH_TRIPLE(13); break;
+        case 14: LAUNCH_TRIPLE(14); break;
+        default: TORCH_CHECK(false, "M_total must be 4096, 8192, or 16384");
+    }
+    #undef LAUNCH_TRIPLE
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -2030,25 +1974,40 @@ torch::Tensor gpu_rans_decode_fp8_triple(
 torch::Tensor gpu_rans_decode_fp8_triple_dump(
     torch::Tensor compressed, torch::Tensor block_offsets,
     torch::Tensor final_states, torch::Tensor sign_mantissa,
-    int64_t n_fp8_per_stream, torch::Tensor marginal_freqs)
+    int64_t n_fp8_per_stream, torch::Tensor freqs,
+    int64_t M_total)
 {
     int64_t n_streams, n_enc_blocks;
-    auto sfc_gpu = build_sfc_table_triple(marginal_freqs, n_streams, n_enc_blocks,
-                                          compressed, block_offsets, final_states,
-                                          sign_mantissa, n_fp8_per_stream);
+    auto sfc_gpu = build_sfc_table_triple(compressed, block_offsets, final_states,
+                                          sign_mantissa, n_fp8_per_stream, freqs,
+                                          M_total, n_streams, n_enc_blocks);
     const int threads = rans_gpu_triple::BLOCK_STREAMS;
     int64_t blocks = (n_enc_blocks + 1) / 2;
+
     auto digest = torch::empty(
         {blocks * threads},
         torch::TensorOptions().dtype(torch::kUInt8).device(compressed.device()));
-    rans_decode_fp8_triple_dump_kernel<<<blocks, threads>>>(
-        reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()),
-        block_offsets.data_ptr<int32_t>(),
-        reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()),
-        reinterpret_cast<const uint32_t*>(sfc_gpu.data_ptr<int32_t>()),
-        sign_mantissa.data_ptr<uint8_t>(),
-        digest.data_ptr<uint8_t>(),
-        n_fp8_per_stream, n_streams);
+
+    int m_log = 0;
+    { int64_t tmp = M_total; while (tmp > 1) { m_log++; tmp >>= 1; } }
+
+    #define LAUNCH_TRIPLE_DUMP(ML) \
+        rans_decode_fp8_triple_dump_kernel<ML><<<blocks, threads>>>( \
+            reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()), \
+            block_offsets.data_ptr<int32_t>(), \
+            reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()), \
+            reinterpret_cast<const uint64_t*>(sfc_gpu.data_ptr<int64_t>()), \
+            sign_mantissa.data_ptr<uint8_t>(), \
+            digest.data_ptr<uint8_t>(), \
+            n_fp8_per_stream, n_streams)
+
+    switch (m_log) {
+        case 12: LAUNCH_TRIPLE_DUMP(12); break;
+        case 13: LAUNCH_TRIPLE_DUMP(13); break;
+        case 14: LAUNCH_TRIPLE_DUMP(14); break;
+        default: TORCH_CHECK(false, "M_total must be 4096, 8192, or 16384");
+    }
+    #undef LAUNCH_TRIPLE_DUMP
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return digest;
 }

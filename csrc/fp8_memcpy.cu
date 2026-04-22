@@ -78,10 +78,10 @@ torch::Tensor gpu_rans_decode_fp8_pair_ldg_dump(
     torch::Tensor);
 torch::Tensor gpu_rans_decode_fp8_triple(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
-    torch::Tensor);
+    torch::Tensor, int64_t);
 torch::Tensor gpu_rans_decode_fp8_triple_dump(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
-    torch::Tensor);
+    torch::Tensor, int64_t);
 torch::Tensor gpu_rans_decode_fp8_pair_bl(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor);
@@ -125,10 +125,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gpu_rans_decode_fp8_pair_ldg_dump", &gpu_rans_decode_fp8_pair_ldg_dump,
           "Bench-only dump variant of gpu_rans_decode_fp8_pair_ldg.");
     m.def("gpu_rans_decode_fp8_triple", &gpu_rans_decode_fp8_triple,
-          "Factored triple decoder: 3 parallel L1 reads from M=1024 marginal "
-          "table. Returns [n_fp8, n_streams] uint8.");
+          "Joint triple decoder: 4096 symbols, uint64 sfc entries, 3 nibbles/step.");
     m.def("gpu_rans_decode_fp8_triple_dump", &gpu_rans_decode_fp8_triple_dump,
-          "Bench-only dump variant of factored triple decoder.");
+          "Bench-only dump variant of joint triple decoder.");
     m.def("gpu_rans_decode_fp8_pair_bl", &gpu_rans_decode_fp8_pair_bl,
           "Branchless-renorm pair decoder. Returns [n_fp8, n_streams] uint8.");
     m.def("gpu_rans_decode_fp8_pair_bl_dump", &gpu_rans_decode_fp8_pair_bl_dump,

@@ -131,16 +131,15 @@ def batch_encode_fp8_pairs(
 
 def batch_encode_fp8_triples(
     fp8_bytes: torch.Tensor,   # [K, N] uint8, FP8 E4M3
-    exp_freqs: torch.Tensor,   # [16] int32 (single-nibble freqs, sum to M)
+    exp_freqs: torch.Tensor,   # [16] int32 (single-nibble freqs)
+    M_total: int = 8192,       # total freq slots for 4096 joint symbols
     block_streams: int = BLOCK_STREAMS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Factored triple encoder: encodes 3 consecutive exponent nibbles as one
-    4096-symbol rANS symbol with M_total = M_TRIPLE^3 = 2^30. The joint
-    frequency is the exact product of marginals — no requantization needed.
+    """Joint triple encoder: encodes 3 consecutive exponent nibbles as one
+    4096-symbol rANS symbol. M_total sets the frequency precision (table size).
 
-    N must be divisible by 3. Returns (compressed, final_states, block_offsets,
-    sign_mantissa_packed, triple_freqs). sign_mantissa is packed in pairs as
-    usual (N/2 bytes per stream); the decoder handles the 3-vs-2 mismatch.
+    N must be divisible by 6. Returns (compressed, final_states, block_offsets,
+    sign_mantissa_packed, triple_freqs).
     """
     assert fp8_bytes.dim() == 2 and fp8_bytes.dtype == torch.uint8
     K, N = fp8_bytes.shape
@@ -149,7 +148,6 @@ def batch_encode_fp8_triples(
     exp_nibbles = (fp8_bytes >> 3) & 0xF
     sm_nibbles  = ((fp8_bytes >> 4) & 0x8) | (fp8_bytes & 0x7)
 
-    # Sign+mantissa packed in pairs (same as always)
     sm_pairs     = sm_nibbles.view(K, N // 2, 2)
     sm_packed_kn = sm_pairs[..., 0] | (sm_pairs[..., 1] << 4)
     sm_packed    = sm_packed_kn.t().contiguous()
@@ -158,19 +156,18 @@ def batch_encode_fp8_triples(
     exp_trips = exp_nibbles.view(K, N // 3, 3)
     triple_syms = (exp_trips[..., 0].int() * 256
                    + exp_trips[..., 1].int() * 16
-                   + exp_trips[..., 2].int()).to(torch.int16)  # [K, N/3]
+                   + exp_trips[..., 2].int()).to(torch.int16)
 
-    # Triple frequencies: exact product of marginals, sums to M^3
-    nib_freqs = quantize_freqs(
-        (exp_freqs.float() / exp_freqs.float().sum()).numpy(), M=M_TRIPLE
-    )
-    nf = nib_freqs.numpy().astype(np.int64)
-    # 3-way outer product → [16, 16, 16] → [4096]
-    triple_f = (nf[:, None, None] * nf[None, :, None] * nf[None, None, :]).flatten()
-    triple_freqs = torch.from_numpy(triple_f.astype(np.int32))
-    assert triple_freqs.sum().item() == M_TRIPLE ** 3
+    # Joint probabilities from marginal distribution (independence assumption)
+    probs = exp_freqs.float()
+    probs = probs / probs.sum()
+    joint_probs = (probs[:, None, None] * probs[None, :, None]
+                   * probs[None, None, :]).flatten().numpy()
+
+    # Quantize directly to M_total (not via marginal products)
+    triple_freqs = quantize_freqs(joint_probs, M=M_total)
 
     compressed, states, block_offsets = _cpu_encode_interleaved(
         triple_syms.contiguous(), triple_freqs, block_streams
     )
-    return compressed, states, block_offsets, sm_packed, nib_freqs
+    return compressed, states, block_offsets, sm_packed, triple_freqs
