@@ -1,15 +1,7 @@
-"""Bench the compressed FP8 pairs decoder at N=128.
+"""Bench the rANS FP8 pair decoder vs HBM-read-only memcpy reference.
 
-Figure of merit: fp8 bytes delivered to SMEM per GB of HBM read. The real
-use case consumes decoded bytes from SMEM for downstream compute (e.g. MMA),
-so HBM writes back to DRAM are benchmark scaffolding, not real cost. We use
-the `_dump` kernel variant which folds decoded bytes into a per-thread XOR
-digest (blockDim.x bytes per block, ~negligible HBM write) — it does exactly
-the same decode work but without the artificial full-size output write.
-
-Memcpy reference is the upper bound of "what if you skipped compression":
-   1 fp8 byte delivered per 1 HBM byte read.
-We want > 1.0x — more fp8 delivered per HBM byte than memcpy can manage.
+Figure of merit: fp8 bytes delivered per GB of HBM read. We want > 1.0x
+— more fp8 delivered per HBM byte than memcpy can manage.
 """
 from __future__ import annotations
 
@@ -19,14 +11,9 @@ import triton.testing
 
 from rans_vectoradd import (
     QWEN3_14B_FP8_EXP,
-    batch_encode_fp8,
-    batch_encode_fp8_pairs,
-    gpu_rans_decode_fp8_dump,
-    gpu_rans_decode_fp8_ldg_dump,
-    gpu_rans_decode_fp8_pair_bl_dump,
-    gpu_rans_decode_fp8_pair_ldg_dump,
-    gpu_rans_decode_fp8_pair_ldg_q4_dump,
-    gpu_rans_decode_fp8_regscan_dump,
+    encode,
+    gpu_rans_decode_dump,
+    fp8_memcpy_digest,
     quantize_freqs,
     random_fp8_bytes,
 )
@@ -34,18 +21,12 @@ from rans_vectoradd import (
 PEAK_GBPS = 1008.0
 
 
-def bench_decoder(kernel, K: int, N: int, fp8_cpu: torch.Tensor,
-                  encoder=None) -> dict:
+def bench_decode(K: int, N: int, fp8_cpu: torch.Tensor) -> dict:
     probs = np.array(QWEN3_14B_FP8_EXP, dtype=np.float64)
     exp_freqs = quantize_freqs(probs)
-    encode = encoder or batch_encode_fp8
-    result = encode(fp8_cpu, exp_freqs)
-    # Pair encoder returns 5 values (includes pair_freqs); single returns 4.
-    if len(result) == 5:
-        compressed, states, block_offsets, sm_packed, dec_freqs = result
-    else:
-        compressed, states, block_offsets, sm_packed = result
-        dec_freqs = exp_freqs
+    compressed, states, block_offsets, sm_packed, pair_freqs = encode(
+        fp8_cpu, exp_freqs
+    )
 
     comp = compressed.cuda()
     off  = block_offsets.cuda()
@@ -53,24 +34,19 @@ def bench_decoder(kernel, K: int, N: int, fp8_cpu: torch.Tensor,
     sm   = sm_packed.cuda()
 
     def _run():
-        kernel(comp, off, st, sm, N, dec_freqs)
+        gpu_rans_decode_dump(comp, off, st, sm, N, pair_freqs)
 
     for _ in range(3):
         _run()
     torch.cuda.synchronize()
     ms = triton.testing.do_bench(_run, warmup=50, rep=200)
 
-    n_bytes = K * N  # total fp8 bytes "delivered"
+    n_bytes = K * N
     s = ms / 1000.0
-    # HBM read: just the compressed inputs. final_states also but it's 4B/stream,
-    # tiny and amortized — include for accuracy. digest write is ignored
-    # (~2 MB, << total).
     hbm_read_bytes = int(comp.numel()) + int(sm.numel()) + int(st.numel()) * 4
     hbm_read_gbps  = hbm_read_bytes / 1e9 / s
     gfp8_per_s     = n_bytes / s / 1e9
-    # "Compression advantage": delivered fp8 per HBM byte read. > 1.0 beats
-    # memcpy per unit HBM.
-    bytes_per_fp8 = hbm_read_bytes / n_bytes
+    bytes_per_fp8  = hbm_read_bytes / n_bytes
     return {
         "ms": ms,
         "Gfp8/s": gfp8_per_s,
@@ -82,11 +58,6 @@ def bench_decoder(kernel, K: int, N: int, fp8_cpu: torch.Tensor,
 
 
 def bench_memcpy_digest(n_bytes: int) -> dict:
-    """Apples-to-apples reference: HBM-read-only fp8 load, folded into a
-    digest. Same HBM access pattern as "load N fp8 bytes into SMEM for
-    downstream MMA consumption" — no HBM write-back. This is the ceiling
-    we're trying to beat."""
-    from rans_vectoradd import fp8_memcpy_digest
     src = torch.empty(n_bytes, dtype=torch.uint8, device="cuda")
 
     def _run():
@@ -119,7 +90,7 @@ def fmt(name: str, r: dict) -> str:
 
 
 def main() -> None:
-    bytes_out = 1 << 29  # 512 MiB — fits around other GPU tenants
+    bytes_out = 1 << 29  # 512 MiB
     print(f"\n=== {bytes_out / (1<<20):.0f} MiB of FP8 delivered ===")
 
     r_cpy = bench_memcpy_digest(bytes_out)
@@ -129,18 +100,12 @@ def main() -> None:
         K = bytes_out // N
         torch.manual_seed(42)
         fp8 = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
-        for name, kernel, enc in (
-            ("exact",    gpu_rans_decode_fp8_dump,         None),
-            ("ldg",      gpu_rans_decode_fp8_ldg_dump,     None),
-            ("pair-ldg", gpu_rans_decode_fp8_pair_ldg_dump, batch_encode_fp8_pairs),
-            ("pair-bl",  gpu_rans_decode_fp8_pair_bl_dump, batch_encode_fp8_pairs),
-        ):
-            r_dec = bench_decoder(kernel, K, N, fp8, encoder=enc)
-            beat = r_dec["Gfp8/s"] / r_cpy["Gfp8/s"]
-            print(fmt(f"rans N={N:<4} {name}", r_dec) +
-                  f"  vs cpy {beat:.2f}x")
-        print()
-
+        r_dec = bench_decode(K, N, fp8)
+        beat = r_dec["Gfp8/s"] / r_cpy["Gfp8/s"]
+        ceiling = r_cpy["HBM read GB/s"] * r_dec["fp8/HBM-byte"]
+        note = (f"vs cpy {beat:.2f}x, HBM-bound ceil {ceiling:.0f} "
+                f"({ceiling/r_cpy['Gfp8/s']:.2f}x cpy)")
+        print(fmt(f"rans-decode N={N}", r_dec) + "  " + note)
 
 
 if __name__ == "__main__":

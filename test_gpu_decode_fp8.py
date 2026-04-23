@@ -9,10 +9,8 @@ import torch
 
 from rans_vectoradd import (
     QWEN3_14B_FP8_EXP,
-    batch_encode_fp8,
-    gpu_rans_decode_fp8,
-    gpu_rans_decode_fp8_ldg,
-    gpu_rans_decode_fp8_regscan,
+    encode,
+    gpu_rans_decode,
     quantize_freqs,
     random_fp8_bytes,
 )
@@ -25,7 +23,7 @@ def run_case(K: int, N: int, seed: int = 42) -> None:
     fp8 = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
 
     t0 = time.perf_counter()
-    compressed, states, block_offsets, sm_packed = batch_encode_fp8(fp8, exp_freqs)
+    compressed, states, block_offsets, sm_packed, pair_freqs = encode(fp8, exp_freqs)
     t_enc = time.perf_counter() - t0
 
     compressed_gpu = compressed.cuda()
@@ -37,31 +35,26 @@ def run_case(K: int, N: int, seed: int = 42) -> None:
     sm_bytes   = int(sm_packed.numel())
     bits_per_fp8 = (comp_bytes + sm_bytes) * 8 / (K * N)
 
-    for label, kernel in (
-        ("exact",   gpu_rans_decode_fp8),
-        ("ldg",     gpu_rans_decode_fp8_ldg),
-        ("regscan", gpu_rans_decode_fp8_regscan),
-    ):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        decoded_gpu = kernel(
-            compressed_gpu, offsets_gpu, states_gpu, sm_gpu, N, exp_freqs
-        )
-        torch.cuda.synchronize()
-        t_dec = time.perf_counter() - t0
-        decoded = decoded_gpu.cpu().t().contiguous()
-        ok = torch.equal(decoded, fp8)
-        status = "✓" if ok else "FAIL"
-        print(
-            f"K={K:>7} N={N:>5}  {label:7s} {status}  "
-            f"comp={comp_bytes:>11,}B  sm={sm_bytes:>11,}B  "
-            f"bits/fp8={bits_per_fp8:.3f}  "
-            f"enc={t_enc * 1000:>6.1f}ms  dec_gpu={t_dec * 1000:>6.2f}ms"
-        )
-        if not ok:
-            diff = (decoded != fp8).any(dim=1).nonzero().flatten()[:5]
-            print(f"  first mismatching rows: {diff.tolist()}")
-            raise SystemExit(1)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    decoded_gpu = gpu_rans_decode(
+        compressed_gpu, offsets_gpu, states_gpu, sm_gpu, N, pair_freqs
+    )
+    torch.cuda.synchronize()
+    t_dec = time.perf_counter() - t0
+    decoded = decoded_gpu.cpu().t().contiguous()
+    ok = torch.equal(decoded, fp8)
+    status = "✓" if ok else "FAIL"
+    print(
+        f"K={K:>7} N={N:>5}  {status}  "
+        f"comp={comp_bytes:>11,}B  sm={sm_bytes:>11,}B  "
+        f"bits/fp8={bits_per_fp8:.3f}  "
+        f"enc={t_enc * 1000:>6.1f}ms  dec_gpu={t_dec * 1000:>6.2f}ms"
+    )
+    if not ok:
+        diff = (decoded != fp8).any(dim=1).nonzero().flatten()[:5]
+        print(f"  first mismatching rows: {diff.tolist()}")
+        raise SystemExit(1)
 
 
 def main() -> None:
