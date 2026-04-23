@@ -2011,3 +2011,463 @@ torch::Tensor gpu_rans_decode_fp8_triple_dump(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return digest;
 }
+
+// ─── tANS (table ANS) decoder ───────────────────────────────────────
+//
+// tANS replaces rANS's multiply+divide+renorm with a single table
+// lookup. Each decode step: read table[state-L] → (sym, nbBits, base),
+// consume nbBits from a bit accumulator, state = base + L + bits.
+// ~5 ALU + 1 L1 read per step (vs ~12 ALU + 1 read for rANS).
+//
+// Table: L entries × uint32. L = 2^tableLog (typically 2048 = 8 KB).
+// Entry packing: sym(4) | nbBits(4) | nextBase(16) | unused(8).
+// State range: [L, 2L). Table indexed by (state - L).
+//
+// Bit accumulator: 32-bit register, MSB-aligned. Consumed by shifting
+// left. Refilled from slab uint32s when acc_bits drops below 16.
+
+namespace rans_gpu_tans {
+constexpr uint32_t L_LOW = 1u << 16;  // not used (tANS doesn't renorm like rANS)
+constexpr int BLOCK_STREAMS = 128;
+}
+
+// Position-based bit reader. Matches the CPU decoder's backward reading
+// exactly: bit_pos starts at (n_bits-1) and decrements. Bits are packed
+// LSB-first into bytes, loaded as little-endian uint32s from slabs.
+// Caches the current uint32 to avoid redundant global loads.
+struct TansCtx {
+    uint32_t state;
+    int      bit_pos;        // current bit position (decrements)
+    uint32_t cached_word;    // current uint32 from slab
+    int      cached_u32_idx; // which uint32 is cached
+    int      base_slab;      // first slab with data (G - G_s)
+    int64_t  block_base_u32;
+};
+
+template <int TABLE_LOG>
+__device__ __forceinline__ uint8_t tans_decode_step(
+    TansCtx& ctx,
+    const uint32_t* __restrict__ table,
+    const uint32_t* __restrict__ compressed_u32,
+    int tid)
+{
+    constexpr uint32_t L = 1u << TABLE_LOG;
+
+    uint32_t entry = __ldg(&table[ctx.state - L]);
+    uint8_t  sym   = entry & 0xFF;
+    int      nb    = (entry >> 8) & 0xF;
+    uint32_t base  = (entry >> 12) & 0xFFFF;
+
+    // Read nb bits from bit_pos going DOWN, assembling LSB-first.
+    // bit_pos points to the highest bit; we read (bit_pos, bit_pos-1, ...).
+    // Within the bitstream, bit i is at byte i/8, position i%8 within byte.
+    // In a uint32 (little-endian): bit i is at position i%32 within uint32 i/32.
+    int end_pos   = ctx.bit_pos;           // highest bit to read
+    int start_pos = ctx.bit_pos - nb + 1;  // lowest bit to read
+
+    int end_u32   = end_pos / 32;
+    int start_u32 = start_pos / 32;
+
+    // Extract nb contiguous bits from the bitstream. The encoder stores
+    // bits MSB-first, but the uint32 extraction pulls low→high, so the
+    // raw value has reversed bit order. __brev fixes this in 1 instruction.
+    uint32_t raw;
+    if (start_u32 == end_u32) {
+        // All bits in one uint32 (common case)
+        if (end_u32 != ctx.cached_u32_idx) {
+            ctx.cached_u32_idx = end_u32;
+            ctx.cached_word = compressed_u32[ctx.block_base_u32
+                + (int64_t)(ctx.base_slab + end_u32) * blockDim.x + tid];
+        }
+        int lo = start_pos & 31;
+        raw = (ctx.cached_word >> lo) & ((1u << nb) - 1);
+    } else {
+        // Bits span two uint32s (rare: ~1 in 11 steps)
+        if (end_u32 != ctx.cached_u32_idx) {
+            ctx.cached_u32_idx = end_u32;
+            ctx.cached_word = compressed_u32[ctx.block_base_u32
+                + (int64_t)(ctx.base_slab + end_u32) * blockDim.x + tid];
+        }
+        int hi_bits = (end_pos & 31) + 1;
+        uint32_t hi_part = ctx.cached_word & ((1u << hi_bits) - 1);
+
+        ctx.cached_u32_idx = start_u32;
+        ctx.cached_word = compressed_u32[ctx.block_base_u32
+            + (int64_t)(ctx.base_slab + start_u32) * blockDim.x + tid];
+        int lo_bits = nb - hi_bits;
+        int lo_start = start_pos & 31;
+        uint32_t lo_part = (ctx.cached_word >> lo_start) & ((1u << lo_bits) - 1);
+
+        raw = lo_part | (hi_part << lo_bits);
+    }
+
+    // Bit-reverse: __brev reverses all 32 bits, then shift to keep nb.
+    uint32_t bits = __brev(raw) >> (32 - nb);
+
+    ctx.bit_pos -= nb;
+    ctx.state = base + L + bits;
+    return sym;
+}
+
+// Helper: initialize TansCtx for a stream.
+__device__ __forceinline__ void tans_init_ctx(
+    TansCtx& ctx,
+    const int32_t* block_offsets, int enc_block,
+    const uint32_t* final_states, int64_t stream_id,
+    const int32_t* bit_counts,
+    const uint32_t* compressed_u32, int tid)
+{
+    int32_t base = block_offsets[enc_block];
+    int32_t next = block_offsets[enc_block + 1];
+    int G = (next - base) / (128 * 4);  // BLOCK_STREAMS * 4 bytes per slab
+
+    ctx.state = final_states[stream_id];
+    ctx.block_base_u32 = (int64_t)base / 4;
+
+    // Bitstream is right-aligned in slabs. Data starts at bit_pos = n_bits - 1.
+    int n_bits = bit_counts[stream_id];
+    int G_s = (n_bits + 31) / 32;  // uint32s needed for this stream
+    ctx.base_slab = G - G_s;       // first slab with data
+    ctx.bit_pos = n_bits - 1;      // start at the last data bit
+
+    // Pre-cache the uint32 containing the starting bit_pos
+    ctx.cached_u32_idx = ctx.bit_pos / 32;
+    ctx.cached_word = compressed_u32[ctx.block_base_u32
+        + (int64_t)(ctx.base_slab + ctx.cached_u32_idx) * 128 + tid];
+}
+
+// Dump kernel for benchmarking.
+template <int TABLE_LOG>
+__global__ void tans_decode_fp8_dump_kernel(
+    const uint32_t* __restrict__ compressed_u32,
+    const int32_t*  __restrict__ block_offsets,
+    const uint32_t* __restrict__ final_states,
+    const uint32_t* __restrict__ table,
+    const uint8_t*  __restrict__ sign_mantissa,
+    const int32_t*  __restrict__ bit_counts,
+    uint8_t*        __restrict__ digest_out,
+    int64_t n_fp8_per_stream,
+    int64_t n_streams)
+{
+    int tid = threadIdx.x;
+    int enc_a = 2 * blockIdx.x, enc_b = 2 * blockIdx.x + 1;
+    int64_t tid_a = (int64_t)enc_a * blockDim.x + tid;
+    int64_t tid_b = (int64_t)enc_b * blockDim.x + tid;
+    bool have_a = tid_a < n_streams, have_b = tid_b < n_streams;
+    if (!have_a && !have_b) return;
+
+    TansCtx A, B;
+    if (have_a) tans_init_ctx(A, block_offsets, enc_a, final_states, tid_a,
+                              bit_counts, compressed_u32, tid);
+    if (have_b) tans_init_ctx(B, block_offsets, enc_b, final_states, tid_b,
+                              bit_counts, compressed_u32, tid);
+
+    uint8_t digest = 0;
+    for (int64_t i = 0; i < n_fp8_per_stream; i++) {
+        uint8_t exp_a = 0, exp_b = 0;
+        if (have_a) exp_a = tans_decode_step<TABLE_LOG>(A, table, compressed_u32, tid);
+        if (have_b) exp_b = tans_decode_step<TABLE_LOG>(B, table, compressed_u32, tid);
+
+        uint8_t sm_byte_a = 0, sm_byte_b = 0;
+        if (have_a) sm_byte_a = sign_mantissa[(i >> 1) * n_streams + tid_a];
+        if (have_b) sm_byte_b = sign_mantissa[(i >> 1) * n_streams + tid_b];
+        uint8_t sm_nib_a = (i & 1) ? (sm_byte_a >> 4) : (sm_byte_a & 0xF);
+        uint8_t sm_nib_b = (i & 1) ? (sm_byte_b >> 4) : (sm_byte_b & 0xF);
+
+        if (have_a) digest ^= ((sm_nib_a & 8) << 4) | (exp_a << 3) | (sm_nib_a & 7);
+        if (have_b) digest ^= ((sm_nib_b & 8) << 4) | (exp_b << 3) | (sm_nib_b & 7);
+    }
+    digest_out[(int64_t)blockIdx.x * blockDim.x + tid] = digest;
+}
+
+// Full-output kernel for correctness.
+template <int TABLE_LOG>
+__global__ void tans_decode_fp8_kernel(
+    const uint32_t* __restrict__ compressed_u32,
+    const int32_t*  __restrict__ block_offsets,
+    const uint32_t* __restrict__ final_states,
+    const uint32_t* __restrict__ table,
+    const uint8_t*  __restrict__ sign_mantissa,
+    const int32_t*  __restrict__ bit_counts,
+    uint8_t*        __restrict__ output,
+    int64_t n_fp8_per_stream,
+    int64_t n_streams)
+{
+    int tid = threadIdx.x;
+    int enc_a = 2 * blockIdx.x, enc_b = 2 * blockIdx.x + 1;
+    int64_t tid_a = (int64_t)enc_a * blockDim.x + tid;
+    int64_t tid_b = (int64_t)enc_b * blockDim.x + tid;
+    bool have_a = tid_a < n_streams, have_b = tid_b < n_streams;
+    if (!have_a && !have_b) return;
+
+    TansCtx A, B;
+    if (have_a) tans_init_ctx(A, block_offsets, enc_a, final_states, tid_a,
+                              bit_counts, compressed_u32, tid);
+    if (have_b) tans_init_ctx(B, block_offsets, enc_b, final_states, tid_b,
+                              bit_counts, compressed_u32, tid);
+
+    for (int64_t i = 0; i < n_fp8_per_stream; i++) {
+        uint8_t exp_a = 0, exp_b = 0;
+        if (have_a) exp_a = tans_decode_step<TABLE_LOG>(A, table, compressed_u32, tid);
+        if (have_b) exp_b = tans_decode_step<TABLE_LOG>(B, table, compressed_u32, tid);
+
+        uint8_t sm_byte_a = 0, sm_byte_b = 0;
+        if (have_a) sm_byte_a = sign_mantissa[(i >> 1) * n_streams + tid_a];
+        if (have_b) sm_byte_b = sign_mantissa[(i >> 1) * n_streams + tid_b];
+        uint8_t sm_nib_a = (i & 1) ? (sm_byte_a >> 4) : (sm_byte_a & 0xF);
+        uint8_t sm_nib_b = (i & 1) ? (sm_byte_b >> 4) : (sm_byte_b & 0xF);
+
+        if (have_a)
+            output[i * n_streams + tid_a] = ((sm_nib_a & 8) << 4) | (exp_a << 3) | (sm_nib_a & 7);
+        if (have_b)
+            output[i * n_streams + tid_b] = ((sm_nib_b & 8) << 4) | (exp_b << 3) | (sm_nib_b & 7);
+    }
+}
+
+// Host launchers
+torch::Tensor gpu_tans_decode_fp8(
+    torch::Tensor compressed, torch::Tensor block_offsets,
+    torch::Tensor final_states, torch::Tensor sign_mantissa,
+    torch::Tensor decode_table, torch::Tensor bit_counts,
+    int64_t n_fp8_per_stream, int64_t table_log)
+{
+    int64_t n_streams = final_states.numel();
+    int64_t n_enc_blocks = (n_streams + rans_gpu_tans::BLOCK_STREAMS - 1)
+                           / rans_gpu_tans::BLOCK_STREAMS;
+    auto output = torch::empty(
+        {n_fp8_per_stream, n_streams},
+        torch::TensorOptions().dtype(torch::kUInt8).device(compressed.device()));
+    const int threads = rans_gpu_tans::BLOCK_STREAMS;
+    int64_t blocks = (n_enc_blocks + 1) / 2;
+
+    #define LAUNCH_TANS(TL) \
+        tans_decode_fp8_kernel<TL><<<blocks, threads>>>( \
+            reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()), \
+            block_offsets.data_ptr<int32_t>(), \
+            reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()), \
+            reinterpret_cast<const uint32_t*>(decode_table.data_ptr<int32_t>()), \
+            sign_mantissa.data_ptr<uint8_t>(), \
+            bit_counts.data_ptr<int32_t>(), \
+            output.data_ptr<uint8_t>(), \
+            n_fp8_per_stream, n_streams)
+    switch (table_log) {
+        case 10: LAUNCH_TANS(10); break;
+        case 11: LAUNCH_TANS(11); break;
+        case 12: LAUNCH_TANS(12); break;
+        default: TORCH_CHECK(false, "table_log must be 10, 11, or 12");
+    }
+    #undef LAUNCH_TANS
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor gpu_tans_decode_fp8_dump(
+    torch::Tensor compressed, torch::Tensor block_offsets,
+    torch::Tensor final_states, torch::Tensor sign_mantissa,
+    torch::Tensor decode_table, torch::Tensor bit_counts,
+    int64_t n_fp8_per_stream, int64_t table_log)
+{
+    int64_t n_streams = final_states.numel();
+    int64_t n_enc_blocks = (n_streams + rans_gpu_tans::BLOCK_STREAMS - 1)
+                           / rans_gpu_tans::BLOCK_STREAMS;
+    const int threads = rans_gpu_tans::BLOCK_STREAMS;
+    int64_t blocks = (n_enc_blocks + 1) / 2;
+    auto digest = torch::empty(
+        {blocks * threads},
+        torch::TensorOptions().dtype(torch::kUInt8).device(compressed.device()));
+
+    #define LAUNCH_TANS_DUMP(TL) \
+        tans_decode_fp8_dump_kernel<TL><<<blocks, threads>>>( \
+            reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()), \
+            block_offsets.data_ptr<int32_t>(), \
+            reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()), \
+            reinterpret_cast<const uint32_t*>(decode_table.data_ptr<int32_t>()), \
+            sign_mantissa.data_ptr<uint8_t>(), \
+            bit_counts.data_ptr<int32_t>(), \
+            digest.data_ptr<uint8_t>(), \
+            n_fp8_per_stream, n_streams)
+    switch (table_log) {
+        case 10: LAUNCH_TANS_DUMP(10); break;
+        case 11: LAUNCH_TANS_DUMP(11); break;
+        case 12: LAUNCH_TANS_DUMP(12); break;
+        default: TORCH_CHECK(false, "table_log must be 10, 11, or 12");
+    }
+    #undef LAUNCH_TANS_DUMP
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return digest;
+}
+
+// ─── Pair-tANS dump kernel ──────────────────────────────────────────
+// Same as tans_decode_fp8_dump_kernel but processes pair symbols:
+// each decode step produces 2 exponent nibbles (1 sm byte consumed).
+// Inner loop runs n_fp8_per_stream/2 times.
+
+template <int TABLE_LOG>
+__global__ void tans_decode_fp8_pair_dump_kernel(
+    const uint32_t* __restrict__ compressed_u32,
+    const int32_t*  __restrict__ block_offsets,
+    const uint32_t* __restrict__ final_states,
+    const uint32_t* __restrict__ table,
+    const uint8_t*  __restrict__ sign_mantissa,
+    const int32_t*  __restrict__ bit_counts,
+    uint8_t*        __restrict__ digest_out,
+    int64_t n_fp8_per_stream,
+    int64_t n_streams)
+{
+    int tid = threadIdx.x;
+    int enc_a = 2 * blockIdx.x, enc_b = 2 * blockIdx.x + 1;
+    int64_t tid_a = (int64_t)enc_a * blockDim.x + tid;
+    int64_t tid_b = (int64_t)enc_b * blockDim.x + tid;
+    bool have_a = tid_a < n_streams, have_b = tid_b < n_streams;
+    if (!have_a && !have_b) return;
+
+    TansCtx A, B;
+    if (have_a) tans_init_ctx(A, block_offsets, enc_a, final_states, tid_a,
+                              bit_counts, compressed_u32, tid);
+    if (have_b) tans_init_ctx(B, block_offsets, enc_b, final_states, tid_b,
+                              bit_counts, compressed_u32, tid);
+
+    uint8_t digest = 0;
+    int64_t n_pairs = n_fp8_per_stream / 2;
+    for (int64_t i = 0; i < n_pairs; i++) {
+        uint8_t pair_a = 0, pair_b = 0;
+        if (have_a) pair_a = tans_decode_step<TABLE_LOG>(A, table, compressed_u32, tid);
+        if (have_b) pair_b = tans_decode_step<TABLE_LOG>(B, table, compressed_u32, tid);
+
+        uint8_t sm_a = 0, sm_b = 0;
+        if (have_a) sm_a = sign_mantissa[i * n_streams + tid_a];
+        if (have_b) sm_b = sign_mantissa[i * n_streams + tid_b];
+
+        if (have_a) {
+            uint8_t e0 = pair_a >> 4, e1 = pair_a & 0xF;
+            uint8_t s0 = sm_a & 0xF, s1 = sm_a >> 4;
+            digest ^= ((s0 & 8) << 4) | (e0 << 3) | (s0 & 7);
+            digest ^= ((s1 & 8) << 4) | (e1 << 3) | (s1 & 7);
+        }
+        if (have_b) {
+            uint8_t e0 = pair_b >> 4, e1 = pair_b & 0xF;
+            uint8_t s0 = sm_b & 0xF, s1 = sm_b >> 4;
+            digest ^= ((s0 & 8) << 4) | (e0 << 3) | (s0 & 7);
+            digest ^= ((s1 & 8) << 4) | (e1 << 3) | (s1 & 7);
+        }
+    }
+    digest_out[(int64_t)blockIdx.x * blockDim.x + tid] = digest;
+}
+
+// Full output for correctness.
+template <int TABLE_LOG>
+__global__ void tans_decode_fp8_pair_kernel(
+    const uint32_t* __restrict__ compressed_u32,
+    const int32_t*  __restrict__ block_offsets,
+    const uint32_t* __restrict__ final_states,
+    const uint32_t* __restrict__ table,
+    const uint8_t*  __restrict__ sign_mantissa,
+    const int32_t*  __restrict__ bit_counts,
+    uint8_t*        __restrict__ output,
+    int64_t n_fp8_per_stream,
+    int64_t n_streams)
+{
+    int tid = threadIdx.x;
+    int enc_a = 2 * blockIdx.x, enc_b = 2 * blockIdx.x + 1;
+    int64_t tid_a = (int64_t)enc_a * blockDim.x + tid;
+    int64_t tid_b = (int64_t)enc_b * blockDim.x + tid;
+    bool have_a = tid_a < n_streams, have_b = tid_b < n_streams;
+    if (!have_a && !have_b) return;
+
+    TansCtx A, B;
+    if (have_a) tans_init_ctx(A, block_offsets, enc_a, final_states, tid_a,
+                              bit_counts, compressed_u32, tid);
+    if (have_b) tans_init_ctx(B, block_offsets, enc_b, final_states, tid_b,
+                              bit_counts, compressed_u32, tid);
+
+    int64_t n_pairs = n_fp8_per_stream / 2;
+    for (int64_t i = 0; i < n_pairs; i++) {
+        uint8_t pair_a = 0, pair_b = 0;
+        if (have_a) pair_a = tans_decode_step<TABLE_LOG>(A, table, compressed_u32, tid);
+        if (have_b) pair_b = tans_decode_step<TABLE_LOG>(B, table, compressed_u32, tid);
+
+        uint8_t sm_a = 0, sm_b = 0;
+        if (have_a) sm_a = sign_mantissa[i * n_streams + tid_a];
+        if (have_b) sm_b = sign_mantissa[i * n_streams + tid_b];
+
+        if (have_a) {
+            uint8_t e0 = pair_a >> 4, e1 = pair_a & 0xF;
+            uint8_t s0 = sm_a & 0xF, s1 = sm_a >> 4;
+            output[(2*i)   * n_streams + tid_a] = ((s0&8)<<4)|(e0<<3)|(s0&7);
+            output[(2*i+1) * n_streams + tid_a] = ((s1&8)<<4)|(e1<<3)|(s1&7);
+        }
+        if (have_b) {
+            uint8_t e0 = pair_b >> 4, e1 = pair_b & 0xF;
+            uint8_t s0 = sm_b & 0xF, s1 = sm_b >> 4;
+            output[(2*i)   * n_streams + tid_b] = ((s0&8)<<4)|(e0<<3)|(s0&7);
+            output[(2*i+1) * n_streams + tid_b] = ((s1&8)<<4)|(e1<<3)|(s1&7);
+        }
+    }
+}
+
+// Host launchers for pair-tANS
+torch::Tensor gpu_tans_decode_fp8_pair(
+    torch::Tensor compressed, torch::Tensor block_offsets,
+    torch::Tensor final_states, torch::Tensor sign_mantissa,
+    torch::Tensor decode_table, torch::Tensor bit_counts,
+    int64_t n_fp8_per_stream, int64_t table_log)
+{
+    int64_t n_streams = final_states.numel();
+    int64_t n_enc_blocks = (n_streams + 128 - 1) / 128;
+    auto output = torch::empty(
+        {n_fp8_per_stream, n_streams},
+        torch::TensorOptions().dtype(torch::kUInt8).device(compressed.device()));
+    int64_t blocks = (n_enc_blocks + 1) / 2;
+
+    #define LAUNCH_TANS_PAIR(TL) \
+        tans_decode_fp8_pair_kernel<TL><<<blocks, 128>>>( \
+            reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()), \
+            block_offsets.data_ptr<int32_t>(), \
+            reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()), \
+            reinterpret_cast<const uint32_t*>(decode_table.data_ptr<int32_t>()), \
+            sign_mantissa.data_ptr<uint8_t>(), \
+            bit_counts.data_ptr<int32_t>(), \
+            output.data_ptr<uint8_t>(), \
+            n_fp8_per_stream, n_streams)
+    switch (table_log) {
+        case 11: LAUNCH_TANS_PAIR(11); break;
+        case 12: LAUNCH_TANS_PAIR(12); break;
+        default: TORCH_CHECK(false, "table_log must be 11 or 12 for pairs");
+    }
+    #undef LAUNCH_TANS_PAIR
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor gpu_tans_decode_fp8_pair_dump(
+    torch::Tensor compressed, torch::Tensor block_offsets,
+    torch::Tensor final_states, torch::Tensor sign_mantissa,
+    torch::Tensor decode_table, torch::Tensor bit_counts,
+    int64_t n_fp8_per_stream, int64_t table_log)
+{
+    int64_t n_streams = final_states.numel();
+    int64_t n_enc_blocks = (n_streams + 128 - 1) / 128;
+    int64_t blocks = (n_enc_blocks + 1) / 2;
+    auto digest = torch::empty(
+        {blocks * 128},
+        torch::TensorOptions().dtype(torch::kUInt8).device(compressed.device()));
+
+    #define LAUNCH_TANS_PAIR_DUMP(TL) \
+        tans_decode_fp8_pair_dump_kernel<TL><<<blocks, 128>>>( \
+            reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()), \
+            block_offsets.data_ptr<int32_t>(), \
+            reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()), \
+            reinterpret_cast<const uint32_t*>(decode_table.data_ptr<int32_t>()), \
+            sign_mantissa.data_ptr<uint8_t>(), \
+            bit_counts.data_ptr<int32_t>(), \
+            digest.data_ptr<uint8_t>(), \
+            n_fp8_per_stream, n_streams)
+    switch (table_log) {
+        case 11: LAUNCH_TANS_PAIR_DUMP(11); break;
+        case 12: LAUNCH_TANS_PAIR_DUMP(12); break;
+        default: TORCH_CHECK(false, "table_log must be 11 or 12 for pairs");
+    }
+    #undef LAUNCH_TANS_PAIR_DUMP
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return digest;
+}

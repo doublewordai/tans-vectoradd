@@ -76,6 +76,18 @@ torch::Tensor gpu_rans_decode_fp8_pair_ldg(
 torch::Tensor gpu_rans_decode_fp8_pair_ldg_dump(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor);
+torch::Tensor gpu_tans_decode_fp8_pair(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int64_t, int64_t);
+torch::Tensor gpu_tans_decode_fp8_pair_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int64_t, int64_t);
+torch::Tensor gpu_tans_decode_fp8(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int64_t, int64_t);
+torch::Tensor gpu_tans_decode_fp8_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int64_t, int64_t);
 torch::Tensor gpu_rans_decode_fp8_triple(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor, int64_t);
@@ -124,6 +136,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "__ldg through L1. Returns [n_fp8_per_stream, n_streams] uint8.");
     m.def("gpu_rans_decode_fp8_pair_ldg_dump", &gpu_rans_decode_fp8_pair_ldg_dump,
           "Bench-only dump variant of gpu_rans_decode_fp8_pair_ldg.");
+    m.def("gpu_tans_decode_fp8_pair", &gpu_tans_decode_fp8_pair,
+          "Pair-tANS decoder: 256-symbol pairs, tANS table. Returns [n_fp8, n_streams].");
+    m.def("gpu_tans_decode_fp8_pair_dump", &gpu_tans_decode_fp8_pair_dump,
+          "Bench-only dump variant of pair-tANS decoder.");
+    m.def("gpu_tans_decode_fp8", &gpu_tans_decode_fp8,
+          "tANS decoder: table lookup, no multiply. Returns [n_fp8, n_streams].");
+    m.def("gpu_tans_decode_fp8_dump", &gpu_tans_decode_fp8_dump,
+          "Bench-only dump variant of tANS decoder.");
     m.def("gpu_rans_decode_fp8_triple", &gpu_rans_decode_fp8_triple,
           "Joint triple decoder: 4096 symbols, uint64 sfc entries, 3 nibbles/step.");
     m.def("gpu_rans_decode_fp8_triple_dump", &gpu_rans_decode_fp8_triple_dump,
