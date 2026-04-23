@@ -603,12 +603,8 @@ __global__ void fp8_vecadd_tiled_kernel(
         }
 
         int64_t out_base = (tile_idx * n_streams + sid) * (int64_t)(TILE * 2);
-        constexpr int OUT_CHUNKS = TILE * 2 / 8;
-        #pragma unroll
-        for (int c = 0; c < OUT_CHUNKS; c++) {
-            *reinterpret_cast<uint64_t*>(output_tiled + out_base + c * 8) =
-                *reinterpret_cast<uint64_t*>(out_buf + c * 8);
-        }
+        *reinterpret_cast<uint4*>(output_tiled + out_base) =
+            *reinterpret_cast<const uint4*>(out_buf);
 
         __syncthreads();
     }
