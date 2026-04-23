@@ -10,6 +10,10 @@ dist/
 *.ncu-rep
 ncu_*/
 
+# Compiler dumps
+*.ptx
+*.sass
+
 # Ad-hoc edit/revert safety copies
 *.bak
 *.new
