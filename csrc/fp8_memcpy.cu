@@ -61,7 +61,7 @@ torch::Tensor fp8_vecadd_raw(torch::Tensor, torch::Tensor);
 torch::Tensor fp8_vecadd_fused(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, int64_t);
+    torch::Tensor, int64_t, int64_t);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rans_encode_interleaved", &rans_encode_interleaved,
