@@ -11,57 +11,22 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
-
-// ─── FP8 E4M3 ↔ half conversion ─────────────────────────────────────
-
-__device__ __forceinline__ __half fp8_to_half(uint8_t fp8) {
-    uint16_t sign = ((uint16_t)(fp8 & 0x80)) << 8;
-    uint16_t exp  = (fp8 >> 3) & 0xF;
-    uint16_t mant = fp8 & 0x7;
-
-    if (exp == 0) {
-        // Subnormal: value = (-1)^s × 2^(-6) × (0.mantissa)
-        // In half: this is a very small subnormal, just return ±0 for simplicity
-        uint16_t h = sign;
-        return *reinterpret_cast<__half*>(&h);
-    }
-    // Normal: rebias exponent from FP8 (bias=7) to half (bias=15)
-    uint16_t exp_h = exp + 8;
-    uint16_t mant_h = (uint16_t)mant << 7;
-    uint16_t h = sign | (exp_h << 10) | mant_h;
-    return *reinterpret_cast<__half*>(&h);
-}
-
-__device__ __forceinline__ uint8_t half_to_fp8(__half val) {
-    uint16_t h = *reinterpret_cast<uint16_t*>(&val);
-    uint8_t sign = (h >> 8) & 0x80;
-    int exp_h = (h >> 10) & 0x1F;
-    int exp = exp_h - 8;  // rebias: half(15) → fp8(7)
-    uint8_t mant = (h >> 7) & 0x7;
-
-    if (exp <= 0) return sign;          // underflow → ±0
-    if (exp >= 15) return sign | 0x7E;  // overflow → max normal (no inf in E4M3)
-    return sign | ((uint8_t)exp << 3) | mant;
-}
-
-__device__ __forceinline__ uint8_t fp8_add(uint8_t a, uint8_t b) {
-    return half_to_fp8(__hadd(fp8_to_half(a), fp8_to_half(b)));
-}
 
 // ─── Uncompressed FP8 vector add baseline ────────────────────────────
 
 __global__ void fp8_vecadd_raw_kernel(
-    const uint8_t* __restrict__ A,
-    const uint8_t* __restrict__ B,
-    uint8_t*       __restrict__ C,
+    const __nv_fp8_e4m3* __restrict__ A,
+    const __nv_fp8_e4m3* __restrict__ B,
+    __nv_fp8_e4m3*       __restrict__ C,
     int64_t n)
 {
     int64_t tid    = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t stride = (int64_t)gridDim.x  * blockDim.x;
     for (int64_t i = tid; i < n; i += stride) {
-        C[i] = fp8_add(A[i], B[i]);
+        C[i] = __nv_fp8_e4m3(float(A[i]) + float(B[i]));
     }
 }
 
@@ -76,8 +41,9 @@ torch::Tensor fp8_vecadd_raw(torch::Tensor A, torch::Tensor B) {
     int blocks = std::min((int)((n + threads - 1) / threads), 512);
 
     fp8_vecadd_raw_kernel<<<blocks, threads>>>(
-        A.data_ptr<uint8_t>(), B.data_ptr<uint8_t>(),
-        C.data_ptr<uint8_t>(), n);
+        reinterpret_cast<const __nv_fp8_e4m3*>(A.data_ptr<uint8_t>()),
+        reinterpret_cast<const __nv_fp8_e4m3*>(B.data_ptr<uint8_t>()),
+        reinterpret_cast<__nv_fp8_e4m3*>(C.data_ptr<uint8_t>()), n);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return C;
 }
@@ -181,21 +147,26 @@ __global__ void fp8_vecadd_fused_kernel(
         uint8_t sm_a = a_sm[i * n_streams + stream_id];
         uint8_t sm_b = b_sm[i * n_streams + stream_id];
 
-        // Compose 2 fp8 bytes from A
+        // Compose FP8 bytes from decoded exponent + sign/mantissa
         uint8_t ea0 = sym_a >> 4, ea1 = sym_a & 0xF;
         uint8_t sa0 = sm_a & 0xF, sa1 = sm_a >> 4;
-        uint8_t fp8_a0 = ((sa0&8)<<4) | (ea0<<3) | (sa0&7);
-        uint8_t fp8_a1 = ((sa1&8)<<4) | (ea1<<3) | (sa1&7);
+        uint8_t ba0 = ((sa0&8)<<4) | (ea0<<3) | (sa0&7);
+        uint8_t ba1 = ((sa1&8)<<4) | (ea1<<3) | (sa1&7);
 
-        // Compose 2 fp8 bytes from B
         uint8_t eb0 = sym_b >> 4, eb1 = sym_b & 0xF;
         uint8_t sb0 = sm_b & 0xF, sb1 = sm_b >> 4;
-        uint8_t fp8_b0 = ((sb0&8)<<4) | (eb0<<3) | (sb0&7);
-        uint8_t fp8_b1 = ((sb1&8)<<4) | (eb1<<3) | (sb1&7);
+        uint8_t bb0 = ((sb0&8)<<4) | (eb0<<3) | (sb0&7);
+        uint8_t bb1 = ((sb1&8)<<4) | (eb1<<3) | (sb1&7);
 
-        // FP8 add + write
-        output[(2*i)   * n_streams + stream_id] = fp8_add(fp8_a0, fp8_b0);
-        output[(2*i+1) * n_streams + stream_id] = fp8_add(fp8_a1, fp8_b1);
+        // Reinterpret as FP8, add natively, write
+        __nv_fp8_e4m3 fa0, fa1, fb0, fb1;
+        memcpy(&fa0, &ba0, 1); memcpy(&fa1, &ba1, 1);
+        memcpy(&fb0, &bb0, 1); memcpy(&fb1, &bb1, 1);
+
+        __nv_fp8_e4m3 c0(float(fa0) + float(fb0));
+        __nv_fp8_e4m3 c1(float(fa1) + float(fb1));
+        memcpy(&output[(2*i)*n_streams + stream_id], &c0, 1);
+        memcpy(&output[(2*i+1)*n_streams + stream_id], &c1, 1);
     }
 }
 
