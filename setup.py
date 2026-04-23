@@ -22,6 +22,7 @@ setup(
                 "csrc/fp8_memcpy.cu",
                 "csrc/rans_codec.cpp",
                 "csrc/rans_decode.cu",
+                "csrc/vecadd.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-fopenmp"],

@@ -57,6 +57,11 @@ torch::Tensor gpu_rans_decode(
 torch::Tensor gpu_rans_decode_dump(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor);
+torch::Tensor fp8_vecadd_raw(torch::Tensor, torch::Tensor);
+torch::Tensor fp8_vecadd_fused(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, int64_t);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rans_encode_interleaved", &rans_encode_interleaved,
@@ -67,4 +72,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Benchmark variant: XOR digest instead of full output.");
     m.def("fp8_memcpy_digest", &fp8_memcpy_digest,
           "HBM-read-only memcpy reference (XOR digest).");
+    m.def("fp8_vecadd_raw", &fp8_vecadd_raw,
+          "Uncompressed FP8 vector add: C[i] = A[i] + B[i].");
+    m.def("fp8_vecadd_fused", &fp8_vecadd_fused,
+          "Fused decompress + FP8 vector add from compressed A and B.");
 }

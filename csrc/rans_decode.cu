@@ -17,7 +17,7 @@ constexpr uint32_t M_SIZE        = 1u << M_LOG;   // 4096
 constexpr uint32_t L_LOW         = 1u << 16;      // 65536
 constexpr int      MAX_ALPHA     = 256;            // pair alphabet
 constexpr int      BLOCK_STREAMS = 128;            // threads per block
-constexpr int      N_STREAMS     = 4;              // streams per thread
+constexpr int      N_STREAMS     = 2;
 
 // ─── Per-stream decode context ───────────────────────────────────────
 
