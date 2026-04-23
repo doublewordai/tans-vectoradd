@@ -182,9 +182,7 @@ __global__ void fp8_vecadd_fused_kernel(
 
     int64_t n_pairs = n_fp8_per_stream / 2;
     for (int64_t i = 0; i < n_pairs; i++) {
-        // Phase A: issue ALL 2*NS sfc LDGs before consuming any.
-        // Also issue sign_mantissa reads here — they're HBM reads that
-        // can overlap with the L1 sfc reads.
+        // Phase A: issue ALL 2*NS sfc LDGs + sm reads before consuming.
         uint32_t entA[NS], entB[NS];
         uint8_t smA[NS], smB[NS];
         #pragma unroll
@@ -198,7 +196,6 @@ __global__ void fp8_vecadd_fused_kernel(
         }
 
         // Phase B: consume A, consume B, add, write — per stream pair.
-        // By now the sfc reads have had time to return.
         #pragma unroll
         for (int q = 0; q < NS; q++) {
             if (have[q]) {
