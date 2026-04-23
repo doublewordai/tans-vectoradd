@@ -58,6 +58,8 @@ torch::Tensor fp8_memcpy_digest(torch::Tensor src) {
 // Forward declarations of functions defined in the sibling TUs.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
     rans_encode_interleaved(torch::Tensor, torch::Tensor, int64_t);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+    tans_encode_interleaved(torch::Tensor, torch::Tensor, int64_t, int64_t);
 torch::Tensor gpu_rans_decode_fp8(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor);
@@ -114,6 +116,9 @@ torch::Tensor gpu_rans_decode_fp8_regscan_dump(
     torch::Tensor);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("tans_encode_interleaved", &tans_encode_interleaved,
+          "CPU tANS encoder → GPU-ready interleaved layout. Returns "
+          "(compressed, final_states, block_offsets, bit_counts).");
     m.def("rans_encode_interleaved", &rans_encode_interleaved,
           "CPU encoder → GPU-ready interleaved layout. Inputs: symbols "
           "[K, N], freqs [n_alphabet], block_streams. Returns "

@@ -2124,11 +2124,15 @@ __device__ __forceinline__ void tans_init_ctx(
     ctx.state = final_states[stream_id];
     ctx.block_base_u32 = (int64_t)base / 4;
 
-    // Bitstream is right-aligned in slabs. Data starts at bit_pos = n_bits - 1.
+    // Bitstream is right-aligned in slabs. Byte-level padding at the start
+    // shifts the data bits up by pad_bytes * 8 positions.
     int n_bits = bit_counts[stream_id];
-    int G_s = (n_bits + 31) / 32;  // uint32s needed for this stream
-    ctx.base_slab = G - G_s;       // first slab with data
-    ctx.bit_pos = n_bits - 1;      // start at the last data bit
+    int n_bytes_raw = (n_bits + 7) / 8;
+    int n_bytes_padded = (n_bytes_raw + 3) & ~3;
+    int pad_bits = (n_bytes_padded - n_bytes_raw) * 8;
+    int G_s = n_bytes_padded / 4;  // uint32s in padded stream
+    ctx.base_slab = G - G_s;
+    ctx.bit_pos = n_bits - 1 + pad_bits;  // account for leading padding
 
     // Pre-cache the uint32 containing the starting bit_pos
     ctx.cached_u32_idx = ctx.bit_pos / 32;

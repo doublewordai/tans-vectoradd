@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from rans_vectoradd._C import rans_encode_interleaved as _cpu_encode_interleaved
+from rans_vectoradd._C import tans_encode_interleaved as _cpu_tans_encode
 from rans_vectoradd.codec import BLOCK_STREAMS, quantize_freqs
 
 
@@ -297,77 +298,15 @@ def batch_encode_fp8_tans_pairs(
     decode_table_np = build_tans_decode_table(pair_freqs_np, table_log)
     decode_table = torch.from_numpy(decode_table_np.astype(np.int32))
 
-    # Build spread + sym_positions for encoder
-    step = (L >> 1) + (L >> 3) + 3
-    if step % 2 == 0:
-        step += 1
-    symbol_table = [0] * L
-    pos = 0
-    for s in range(256):
-        for _ in range(int(pair_freqs_np[s])):
-            symbol_table[pos] = s
-            pos = (pos + step) % L
-    sym_positions = [[] for _ in range(256)]
-    for x in range(L):
-        sym_positions[symbol_table[x]].append(x)
+    pair_freqs_t = torch.from_numpy(pair_freqs_np.astype(np.int32))
 
-    # Encode each stream
-    all_bitstreams = []
-    all_states = []
-    all_nbits = []
+    # Use fast C++ encoder with OpenMP parallelization
+    pair_syms_t = torch.from_numpy(pair_syms).contiguous()
+    compressed, states, offsets, nbits = _cpu_tans_encode(
+        pair_syms_t, pair_freqs_t, block_streams, table_log
+    )
 
-    for k in range(K):
-        syms = pair_syms[k]  # [N/2] uint8
-        state, bitstream, n_bits = tans_encode_stream(
-            syms, pair_freqs_np, table_log)
-        all_states.append(state)
-        all_bitstreams.append(bitstream)
-        all_nbits.append(n_bits)
-
-    # Pack into slab format (same as single-nibble tANS)
-    n_blocks = (K + block_streams - 1) // block_streams
-    padded = []
-    padded_lens = []
-    for bs in all_bitstreams:
-        pad = (4 - len(bs) % 4) % 4
-        padded.append(bs + b'\x00' * pad)
-        padded_lens.append(len(bs) + pad)
-
-    block_offsets = [0]
-    block_Gs = []
-    for b in range(n_blocks):
-        start = b * block_streams
-        end = min(start + block_streams, K)
-        max_len = max(padded_lens[start:end])
-        if max_len == 0:
-            max_len = 4
-        G = max_len // 4
-        if G & 1:
-            G += 1
-        block_Gs.append(G)
-        block_offsets.append(block_offsets[-1] + G * block_streams * 4)
-
-    total_bytes = block_offsets[-1]
-    compressed = bytearray(total_bytes)
-
-    for k in range(K):
-        b = k // block_streams
-        tid_enc = k % block_streams
-        G_b = block_Gs[b]
-        stream_bytes = padded[k]
-        G_s = len(stream_bytes) // 4
-        base_offset = block_offsets[b]
-        for g in range(G_s):
-            slab_idx = G_b - G_s + g
-            dst = base_offset + slab_idx * block_streams * 4 + tid_enc * 4
-            compressed[dst:dst + 4] = stream_bytes[g * 4:(g + 1) * 4]
-
-    compressed_t = torch.frombuffer(bytearray(compressed), dtype=torch.uint8).clone()
-    states_t = torch.tensor(all_states, dtype=torch.int32)
-    offsets_t = torch.tensor(block_offsets, dtype=torch.int32)
-    nbits_t = torch.tensor(all_nbits, dtype=torch.int32)
-
-    return compressed_t, states_t, offsets_t, sm_packed, decode_table, nbits_t
+    return compressed, states, offsets, sm_packed, decode_table, nbits
 
 
 def batch_encode_fp8_tans(
