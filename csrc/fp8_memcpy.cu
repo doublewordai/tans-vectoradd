@@ -78,6 +78,9 @@ torch::Tensor gpu_rans_decode_fp8_pair_ldg(
 torch::Tensor gpu_rans_decode_fp8_pair_ldg_dump(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor);
+torch::Tensor gpu_rans_decode_fp8_pair_il3_dump(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor);
 torch::Tensor gpu_rans_decode_fp8_pair_interleaved_dump(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor);
@@ -144,6 +147,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "__ldg through L1. Returns [n_fp8_per_stream, n_streams] uint8.");
     m.def("gpu_rans_decode_fp8_pair_ldg_dump", &gpu_rans_decode_fp8_pair_ldg_dump,
           "Bench-only dump variant of gpu_rans_decode_fp8_pair_ldg.");
+    m.def("gpu_rans_decode_fp8_pair_il3_dump",
+          &gpu_rans_decode_fp8_pair_il3_dump,
+          "3-stream interleaved pair decoder.");
     m.def("gpu_rans_decode_fp8_pair_interleaved_dump",
           &gpu_rans_decode_fp8_pair_interleaved_dump,
           "Interleaved dual-stream pair decoder: issues both LDGs before "

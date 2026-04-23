@@ -2636,3 +2636,122 @@ torch::Tensor gpu_rans_decode_fp8_pair_interleaved_dump(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return digest;
 }
+
+// ─── Triple-interleaved pair decode (3 streams per thread) ───────────
+// 3 __ldg reads in Phase A, consuming results in Phase B.
+// Same branchless renorm. 3 streams × 7 regs = 21 regs for contexts.
+
+__global__ void rans_decode_fp8_pair_il3_dump_kernel(
+    const uint32_t* __restrict__ compressed_u32,
+    const int32_t*  __restrict__ block_offsets,
+    const uint32_t* __restrict__ final_states,
+    const uint32_t* __restrict__ sfc_global,
+    const uint8_t*  __restrict__ sign_mantissa,
+    uint8_t*        __restrict__ digest_out,
+    int64_t n_fp8_per_stream,
+    int64_t n_streams)
+{
+    int tid = threadIdx.x;
+    RansCtx ctx[3];
+    int64_t tid_s[3];
+    bool have[3];
+
+    #pragma unroll
+    for (int q = 0; q < 3; q++) {
+        int enc = 3 * blockIdx.x + q;
+        tid_s[q] = (int64_t)enc * blockDim.x + tid;
+        have[q] = tid_s[q] < n_streams;
+        if (have[q]) {
+            int32_t base = block_offsets[enc], next = block_offsets[enc+1];
+            int G = (next-base)/((int)blockDim.x*4);
+            ctx[q].x = final_states[tid_s[q]]; ctx[q].slab_idx = G;
+            ctx[q].buf_hi=0; ctx[q].buf_lo=0; ctx[q].buf_avail=0;
+            ctx[q].block_base_u32 = (int64_t)base/4;
+        }
+    }
+    if (!have[0] && !have[1] && !have[2]) return;
+
+    uint8_t digest = 0;
+    int64_t n_pairs = n_fp8_per_stream / 2;
+
+    for (int64_t i = 0; i < n_pairs; i++) {
+        // Phase A: issue all 3 __ldg reads
+        uint32_t slot[3], entry[3];
+        #pragma unroll
+        for (int q = 0; q < 3; q++) {
+            if (have[q]) {
+                slot[q] = ctx[q].x & (rans_gpu_pair::M_SIZE - 1);
+                entry[q] = __ldg(&sfc_global[slot[q]]);
+            }
+        }
+
+        // Phase B: consume results + state update + branchless renorm
+        uint8_t sym[3];
+        #pragma unroll
+        for (int q = 0; q < 3; q++) {
+            if (have[q]) {
+                sym[q] = (uint8_t)(entry[q] & 0xFF);
+                uint32_t f = (entry[q] >> 8) & 0xFFF;
+                uint32_t c = (entry[q] >> 20) & 0xFFF;
+                ctx[q].x = (ctx[q].x >> rans_gpu_pair::M_LOG) * f + (slot[q] - c);
+
+                bool need = (ctx[q].x < rans_gpu_pair::L_LOW);
+                if (need && ctx[q].buf_avail == 0) {
+                    ctx[q].slab_idx -= 2;
+                    int64_t off = ctx[q].block_base_u32
+                        + (int64_t)ctx[q].slab_idx * blockDim.x + tid;
+                    ctx[q].buf_lo = compressed_u32[off];
+                    ctx[q].buf_hi = compressed_u32[off + blockDim.x];
+                    ctx[q].buf_avail = 4;
+                }
+                uint32_t x_r  = (ctx[q].x << 16) | (ctx[q].buf_hi >> 16);
+                uint32_t bh_s = (ctx[q].buf_hi << 16) | (ctx[q].buf_lo >> 16);
+                uint32_t bl_s = ctx[q].buf_lo << 16;
+                int      av_d = ctx[q].buf_avail - 1;
+                ctx[q].x         = need ? x_r  : ctx[q].x;
+                ctx[q].buf_hi    = need ? bh_s : ctx[q].buf_hi;
+                ctx[q].buf_lo    = need ? bl_s : ctx[q].buf_lo;
+                ctx[q].buf_avail = need ? av_d : ctx[q].buf_avail;
+            }
+        }
+
+        // Phase C: compose fp8 + digest
+        #pragma unroll
+        for (int q = 0; q < 3; q++) {
+            if (have[q]) {
+                uint8_t sm = sign_mantissa[i * n_streams + tid_s[q]];
+                uint8_t e0 = sym[q] >> 4, e1 = sym[q] & 0xF;
+                uint8_t s0 = sm & 0xF, s1 = sm >> 4;
+                digest ^= ((s0&8)<<4)|(e0<<3)|(s0&7);
+                digest ^= ((s1&8)<<4)|(e1<<3)|(s1&7);
+            }
+        }
+    }
+    digest_out[(int64_t)blockIdx.x * blockDim.x + tid] = digest;
+}
+
+torch::Tensor gpu_rans_decode_fp8_pair_il3_dump(
+    torch::Tensor compressed, torch::Tensor block_offsets,
+    torch::Tensor final_states, torch::Tensor sign_mantissa,
+    int64_t n_fp8_per_stream, torch::Tensor freqs)
+{
+    int64_t n_streams, n_enc_blocks;
+    auto sfc_gpu = build_sfc_table_pair(compressed, block_offsets, final_states,
+                                        sign_mantissa, n_fp8_per_stream, freqs,
+                                        n_streams, n_enc_blocks);
+    const int threads = rans_gpu_pair::BLOCK_STREAMS;
+    int64_t blocks = (n_enc_blocks + 2) / 3;
+    auto digest = torch::empty(
+        {blocks * threads},
+        torch::TensorOptions().dtype(torch::kUInt8).device(compressed.device()));
+    rans_decode_fp8_pair_il3_dump_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const uint32_t*>(compressed.data_ptr<uint8_t>()),
+        block_offsets.data_ptr<int32_t>(),
+        reinterpret_cast<const uint32_t*>(final_states.data_ptr<int32_t>()),
+        reinterpret_cast<const uint32_t*>(sfc_gpu.data_ptr<int32_t>()),
+        sign_mantissa.data_ptr<uint8_t>(),
+        digest.data_ptr<uint8_t>(),
+        n_fp8_per_stream, n_streams);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return digest;
+}
