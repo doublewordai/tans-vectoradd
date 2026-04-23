@@ -180,22 +180,47 @@ __global__ void fp8_vecadd_fused_kernel(
     for (int q = 0; q < NS; q++) any |= have[q];
     if (!any) return;
 
+    // Software-pipelined loop: the output writes from iteration i-1
+    // overlap with the sfc reads from iteration i. The DRAM write
+    // (output) and L1 read (sfc) use different memory paths and can
+    // be in flight simultaneously.
+    //
+    // Structure:
+    //   Prologue: issue sfc reads + sm reads for iteration 0
+    //   Main loop: write prev results → issue next sfc+sm → consume current
+    //   Epilogue: write final results
+
     int64_t n_pairs = n_fp8_per_stream / 2;
+
+    // Prologue: issue first iteration's reads
+    uint32_t entA[NS], entB[NS];
+    uint8_t smA_val[NS], smB_val[NS];
+    #pragma unroll
+    for (int q = 0; q < NS; q++) {
+        if (have[q]) {
+            entA[q] = __ldg(&sfc[ctxA[q].x & (M_SIZE-1)]);
+            entB[q] = __ldg(&sfc[ctxB[q].x & (M_SIZE-1)]);
+            smA_val[q] = a_sm[0 * n_streams + sid[q]];
+            smB_val[q] = b_sm[0 * n_streams + sid[q]];
+        }
+    }
+
+    // Pending output from previous iteration (invalid for i=0)
+    uint8_t out0[NS], out1[NS];
+
     for (int64_t i = 0; i < n_pairs; i++) {
-        // Phase A: issue ALL 2*NS sfc LDGs + sm reads before consuming.
-        uint32_t entA[NS], entB[NS];
-        uint8_t smA[NS], smB[NS];
-        #pragma unroll
-        for (int q = 0; q < NS; q++) {
-            if (have[q]) {
-                entA[q] = __ldg(&sfc[ctxA[q].x & (M_SIZE-1)]);
-                entB[q] = __ldg(&sfc[ctxB[q].x & (M_SIZE-1)]);
-                smA[q] = a_sm[i * n_streams + sid[q]];
-                smB[q] = b_sm[i * n_streams + sid[q]];
+        // ── Step 1: Write PREVIOUS iteration's output (DRAM store) ──
+        if (i > 0) {
+            #pragma unroll
+            for (int q = 0; q < NS; q++) {
+                if (have[q]) {
+                    output[(2*(i-1))*n_streams + sid[q]] = out0[q];
+                    output[(2*(i-1)+1)*n_streams + sid[q]] = out1[q];
+                }
             }
         }
 
-        // Phase B: consume A, consume B, add, write — per stream pair.
+        // ── Step 2: Consume current entries ──
         #pragma unroll
         for (int q = 0; q < NS; q++) {
             if (have[q]) {
@@ -235,18 +260,40 @@ __global__ void fp8_vecadd_fused_kernel(
                 ctxB[q].x=needB?xrB:ctxB[q].x; ctxB[q].buf_hi=needB?bhB:ctxB[q].buf_hi;
                 ctxB[q].buf_lo=needB?blB:ctxB[q].buf_lo; ctxB[q].buf_avail=needB?avB:ctxB[q].buf_avail;
 
-                // Compose + add + write
-                __nv_fp8_e4m3 a0 = compose_fp8(symA >> 4, smA[q] & 0xF);
-                __nv_fp8_e4m3 b0 = compose_fp8(symB >> 4, smB[q] & 0xF);
+                // Compose + add → store in pending output
+                __nv_fp8_e4m3 a0 = compose_fp8(symA >> 4, smA_val[q] & 0xF);
+                __nv_fp8_e4m3 b0 = compose_fp8(symB >> 4, smB_val[q] & 0xF);
                 __nv_fp8_e4m3 c0(float(a0) + float(b0));
 
-                __nv_fp8_e4m3 a1 = compose_fp8(symA & 0xF, smA[q] >> 4);
-                __nv_fp8_e4m3 b1 = compose_fp8(symB & 0xF, smB[q] >> 4);
+                __nv_fp8_e4m3 a1 = compose_fp8(symA & 0xF, smA_val[q] >> 4);
+                __nv_fp8_e4m3 b1 = compose_fp8(symB & 0xF, smB_val[q] >> 4);
                 __nv_fp8_e4m3 c1(float(a1) + float(b1));
 
-                memcpy(&output[(2*i)*n_streams + sid[q]], &c0, 1);
-                memcpy(&output[(2*i+1)*n_streams + sid[q]], &c1, 1);
+                memcpy(&out0[q], &c0, 1);
+                memcpy(&out1[q], &c1, 1);
             }
+        }
+
+        // ── Step 3: Issue NEXT iteration's sfc reads + sm reads ──
+        if (i + 1 < n_pairs) {
+            #pragma unroll
+            for (int q = 0; q < NS; q++) {
+                if (have[q]) {
+                    entA[q] = __ldg(&sfc[ctxA[q].x & (M_SIZE-1)]);
+                    entB[q] = __ldg(&sfc[ctxB[q].x & (M_SIZE-1)]);
+                    smA_val[q] = a_sm[(i+1) * n_streams + sid[q]];
+                    smB_val[q] = b_sm[(i+1) * n_streams + sid[q]];
+                }
+            }
+        }
+    }
+
+    // Epilogue: write final iteration
+    #pragma unroll
+    for (int q = 0; q < NS; q++) {
+        if (have[q]) {
+            output[(2*(n_pairs-1))*n_streams + sid[q]] = out0[q];
+            output[(2*(n_pairs-1)+1)*n_streams + sid[q]] = out1[q];
         }
     }
 }
