@@ -56,11 +56,15 @@ def encode(
     fp8_bytes: torch.Tensor,   # [K, N] uint8, FP8 E4M3
     exp_freqs: torch.Tensor,   # [16] int32 (single-nibble freqs)
     block_streams: int = BLOCK_STREAMS,
+    tile: int = 0,             # 0 = pair-major (original), >0 = tiled layout
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Encode FP8 bytes using the pair alphabet.
 
     Two consecutive exponent nibbles are encoded as a single 256-symbol
     rANS symbol with M=4096. Halves decode steps vs single-nibble.
+
+    If tile > 0, sm_packed is returned in tiled layout [n_tiles, K, tile]
+    for vectorized GPU loads with better DRAM row buffer hits.
 
     Returns (compressed, final_states, block_offsets, sign_mantissa_packed,
     pair_freqs). Pass pair_freqs to gpu_rans_decode / gpu_rans_decode_dump.
@@ -74,7 +78,15 @@ def encode(
 
     sm_pairs     = sm_nibbles.view(K, N // 2, 2)
     sm_packed_kn = sm_pairs[..., 0] | (sm_pairs[..., 1] << 4)
-    sm_packed    = sm_packed_kn.t().contiguous()
+
+    if tile > 0:
+        n_pairs = N // 2
+        assert n_pairs % tile == 0, f"n_pairs={n_pairs} not divisible by tile={tile}"
+        n_tiles = n_pairs // tile
+        # [K, n_tiles, tile] -> [n_tiles, K, tile] for coalesced tiled access
+        sm_packed = sm_packed_kn.reshape(K, n_tiles, tile).permute(1, 0, 2).contiguous()
+    else:
+        sm_packed = sm_packed_kn.t().contiguous()
 
     # Pair symbols: consecutive exponent nibbles → single 0-255 symbol
     exp_pairs = exp_nibbles.view(K, N // 2, 2)

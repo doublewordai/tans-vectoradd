@@ -47,8 +47,9 @@ def bench_fused(n_bytes: int, N: int, ns: int) -> dict:
     fp8_a = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
     fp8_b = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
 
-    ca, sa, oa, sma, pf = encode(fp8_a, exp_freqs)
-    cb, sb, ob, smb, _  = encode(fp8_b, exp_freqs)
+    tile = 8 if ns == 704 else 0
+    ca, sa, oa, sma, pf = encode(fp8_a, exp_freqs, tile=tile)
+    cb, sb, ob, smb, _  = encode(fp8_b, exp_freqs, tile=tile)
 
     # Build sfc table from pair_freqs
     pf_np = pf.numpy().astype(np.int32)
@@ -94,15 +95,14 @@ def bench_fused(n_bytes: int, N: int, ns: int) -> dict:
 
 def main() -> None:
     sizes = [
-        (1 << 29, "512 MiB"),
-        (1 << 30, "1024 MiB"),
+        (1 << 30, "1 GiB"),
     ]
     configs = [
-        (8, "fused EPB=8"),
-        (504, "twopass T=8 EPB=4"),
+        (504, "twopass"),
+        (704, "tiled"),
     ]
 
-    for N in [128, 256]:
+    for N in [128, 256, 512, 1024, 2048]:
         print(f"\n{'=' * 72}")
         print(f"N={N}")
         print(f"{'=' * 72}")
