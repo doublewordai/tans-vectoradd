@@ -47,7 +47,14 @@ def bench_raw(M: int, K: int) -> float:
 SEG_PER_ROW = 32
 
 
-def bench_fused(M: int, K: int, *, epb: int = 2, tile: int = 8) -> tuple[float, float]:
+def bench_fused(
+    M: int,
+    K: int,
+    *,
+    epb: int | None = None,
+    tile: int | None = None,
+) -> tuple[float, float]:
+    encode_tile = 8 if tile is None else tile
     exp_freqs = quantize_freqs(np.array(QWEN3_14B_FP8_EXP, dtype=np.float64))
     torch.manual_seed(42)
     W_cpu = random_fp8_bytes(M * K, device="cpu").reshape(M, K)
@@ -57,7 +64,7 @@ def bench_fused(M: int, K: int, *, epb: int = 2, tile: int = 8) -> tuple[float, 
     N_seg = K // SEG_PER_ROW
     W_seg = W_cpu.reshape(M, SEG_PER_ROW, N_seg).reshape(M * SEG_PER_ROW, N_seg)
 
-    comp, states, offsets, sm, pf = encode(W_seg, exp_freqs, tile=tile)
+    comp, states, offsets, sm, pf = encode(W_seg, exp_freqs, tile=encode_tile)
     sfc_t = build_sfc(pf)
 
     W_comp = comp.cuda()
@@ -72,8 +79,14 @@ def bench_fused(M: int, K: int, *, epb: int = 2, tile: int = 8) -> tuple[float, 
 
     old_epb = os.environ.get("RANS_GEMV_EPB")
     old_tile = os.environ.get("RANS_GEMV_TILE")
-    os.environ["RANS_GEMV_EPB"] = str(epb)
-    os.environ["RANS_GEMV_TILE"] = str(tile)
+    if epb is None:
+        os.environ.pop("RANS_GEMV_EPB", None)
+    else:
+        os.environ["RANS_GEMV_EPB"] = str(epb)
+    if tile is None:
+        os.environ.pop("RANS_GEMV_TILE", None)
+    else:
+        os.environ["RANS_GEMV_TILE"] = str(tile)
 
     def _run():
         fp8_gemv_fused(W_comp, W_offsets, W_states, W_sm, sfc_t, x, K)

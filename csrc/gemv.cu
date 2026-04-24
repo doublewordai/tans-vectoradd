@@ -31,6 +31,19 @@ int getenv_int(const char* name, int default_value) {
     return std::atoi(value);
 }
 
+bool getenv_is_set(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0';
+}
+
+int choose_auto_epb(int64_t M, int64_t n_enc_blocks) {
+    int epb = (M >= 8192) ? 8 : 4;
+    while (epb > 1 && (n_enc_blocks % epb) != 0) {
+        epb >>= 1;
+    }
+    return epb;
+}
+
 struct RansCtx {
     uint32_t x;
     int      slab_avail;   // (slab_idx << 3) | buf_avail
@@ -165,11 +178,7 @@ __global__ void fp8_gemv_fused_kernel(
     static_assert(EW % SEG_PER_ROW == 0, "BLOCK_STREAMS must be divisible by SEG_PER_ROW");
 
     extern __shared__ uint8_t smem_raw[];
-    uint32_t* sfc_smem = reinterpret_cast<uint32_t*>(smem_raw);
-
-    for (int i = threadIdx.x; i < 4096; i += blockDim.x)
-        sfc_smem[i] = sfc[i];
-    __syncthreads();
+    __half* x_smem = reinterpret_cast<__half*>(smem_raw);
 
     int enc_group = threadIdx.x / EW;
     int tid       = threadIdx.x % EW;            // 0..127 within enc block
@@ -191,17 +200,23 @@ __global__ void fp8_gemv_fused_kernel(
         ctx.block_base_u32 = base / 4;
     }
     unsigned active_mask = __ballot_sync(0xFFFFFFFF, active);
-    if (!active) return;
 
     int N_seg = K / SEG_PER_ROW;
     int n_pairs = N_seg / 2;
     int n_tiles_total = n_pairs / TILE;
-    int x_base = seg_idx * N_seg;
     int64_t n_streams = (int64_t)M * SEG_PER_ROW;
 
     float acc = 0.0f;
 
     for (int tile_idx = 0; tile_idx < n_tiles_total; tile_idx++) {
+        for (int i = threadIdx.x; i < SEG_PER_ROW * TILE * 2; i += blockDim.x) {
+            int s = i / (TILE * 2);
+            int k = i - s * (TILE * 2);
+            x_smem[i] = x[s * N_seg + tile_idx * TILE * 2 + k];
+        }
+        __syncthreads();
+
+        if (active) {
         {
             bool need = (CTX_BUF_AVAIL(ctx) == 0);
             if (__ballot_sync(active_mask, need)) {
@@ -220,7 +235,7 @@ __global__ void fp8_gemv_fused_kernel(
 
         #pragma unroll
         for (int t = 0; t < TILE; t++) {
-            uint32_t ent = sfc_smem[ctx.x & (M_SIZE-1)];
+            uint32_t ent = __ldg(sfc + (ctx.x & (M_SIZE-1)));
             uint8_t sym = ent & 0xFF;
             uint32_t f = (ent>>8)&0xFFF, c = (ent>>20)&0xFFF;
             uint32_t sl = ctx.x & (M_SIZE-1);
@@ -242,14 +257,17 @@ __global__ void fp8_gemv_fused_kernel(
             uint8_t sm_val = (uint8_t)(sm_chunks[t / 8] >> ((t % 8) * 8));
             uint8_t w0_b = ((sm_val & 8) << 4) | ((sym >> 4) << 3) | (sm_val & 7);
             uint8_t w1_b = (((sm_val >> 4) & 8) << 4) | ((sym & 0xF) << 3) | ((sm_val >> 4) & 7);
-            __nv_fp8x2_e4m3 w_pair;
-            w_pair.__x = (__nv_fp8x2_storage_t)((uint16_t)w0_b | ((uint16_t)w1_b << 8));
-            float2 wf = static_cast<float2>(w_pair);
+            __nv_fp8_e4m3 w0;
+            __nv_fp8_e4m3 w1;
+            w0.__x = (__nv_fp8_storage_t)w0_b;
+            w1.__x = (__nv_fp8_storage_t)w1_b;
+            float2 wf = make_float2((float)w0, (float)w1);
 
-            int k_in_seg = (tile_idx * TILE + t) * 2;
-            acc += wf.x * __half2float(__ldg(x + x_base + k_in_seg));
-            acc += wf.y * __half2float(__ldg(x + x_base + k_in_seg + 1));
+            acc += wf.x * __half2float(x_smem[seg_idx * TILE * 2 + t * 2]);
+            acc += wf.y * __half2float(x_smem[seg_idx * TILE * 2 + t * 2 + 1]);
         }
+        }
+        __syncthreads();
     }
 
     // Warp-level reduction: 32 threads per row → single sum.
@@ -257,7 +275,7 @@ __global__ void fp8_gemv_fused_kernel(
     for (int offset = SEG_PER_ROW / 2; offset > 0; offset >>= 1)
         acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
 
-    if (seg_idx == 0)
+    if (active && seg_idx == 0)
         y[m] = __float2half(acc);
 }
 
@@ -276,8 +294,10 @@ torch::Tensor fp8_gemv_fused(
     TORCH_CHECK(n_streams % SEG_PER_ROW == 0, "n_streams must be divisible by SEG_PER_ROW");
     int64_t M = n_streams / SEG_PER_ROW;
     int64_t n_enc_blocks = n_streams / BLOCK_STREAMS;
-    int epb = getenv_int("RANS_GEMV_EPB", 2);
-    int tile = getenv_int("RANS_GEMV_TILE", 8);
+    bool epb_env_set = getenv_is_set("RANS_GEMV_EPB");
+    bool tile_env_set = getenv_is_set("RANS_GEMV_TILE");
+    int epb = epb_env_set ? getenv_int("RANS_GEMV_EPB", 2) : choose_auto_epb(M, n_enc_blocks);
+    int tile = tile_env_set ? getenv_int("RANS_GEMV_TILE", 8) : 8;
     TORCH_CHECK(epb == 1 || epb == 2 || epb == 4 || epb == 8,
                 "RANS_GEMV_EPB must be one of 1, 2, 4, 8");
     TORCH_CHECK(tile == 8 || tile == 16 || tile == 32,
@@ -289,7 +309,7 @@ torch::Tensor fp8_gemv_fused(
     auto y = torch::empty({M},
         torch::TensorOptions().dtype(torch::kHalf).device(W_compressed.device()));
 
-    size_t smem_bytes = 4096 * 4;
+    size_t smem_bytes = SEG_PER_ROW * tile * 2 * sizeof(__half);
     TORCH_CHECK(smem_bytes <= 99 * 1024, "dynamic SMEM request is too large");
 #define LAUNCH_FUSED(EPB_VALUE, TILE_VALUE) do {                                      \
     if (smem_bytes > 48 * 1024) {                                                     \
