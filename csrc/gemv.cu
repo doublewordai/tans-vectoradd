@@ -60,13 +60,6 @@ __global__ void fp8_gemv_raw_kernel(
     __half*        __restrict__ y,    // [M]
     int M, int K)
 {
-    extern __shared__ uint8_t smem_raw[];
-    __half* x_smem = reinterpret_cast<__half*>(smem_raw);
-
-    for (int i = threadIdx.x; i < K; i += blockDim.x)
-        x_smem[i] = x[i];
-    __syncthreads();
-
     int warps_per_block = blockDim.x / 32;
     int warp_in_block   = threadIdx.x / 32;
     int lane            = threadIdx.x & 31;
@@ -87,11 +80,12 @@ __global__ void fp8_gemv_raw_kernel(
         for (int w_off = 0; w_off < 4; w_off++) {
             uint32_t word = (&w_vec.x)[w_off];
             #pragma unroll
-            for (int b = 0; b < 4; b++) {
-                uint8_t wb = (word >> (b * 8)) & 0xFF;
-                __nv_fp8_e4m3 w;
-                memcpy(&w, &wb, 1);
-                acc += float(w) * __half2float(x_smem[k_base + w_off * 4 + b]);
+            for (int p = 0; p < 2; p++) {
+                __nv_fp8x2_e4m3 w_pair;
+                w_pair.__x = (__nv_fp8x2_storage_t)((word >> (p * 16)) & 0xFFFF);
+                float2 wf = static_cast<float2>(w_pair);
+                acc += wf.x * __half2float(x[k_base + w_off * 4 + p * 2]);
+                acc += wf.y * __half2float(x[k_base + w_off * 4 + p * 2 + 1]);
             }
         }
     }
@@ -116,18 +110,12 @@ torch::Tensor fp8_gemv_raw(torch::Tensor W, torch::Tensor x) {
     auto y = torch::empty({M},
         torch::TensorOptions().dtype(torch::kHalf).device(W.device()));
 
-    // 256 threads/block = 8 warps/block = 8 output rows/block
-    const int threads = 256;
+    // 128 threads/block = 4 warps/block = 4 output rows/block. Smaller
+    // blocks improve scheduling granularity for this one-warp-per-row kernel.
+    const int threads = 128;
     int warps_per_block = threads / 32;
     int blocks = (M + warps_per_block - 1) / warps_per_block;
-    size_t smem = K * sizeof(__half);
-    TORCH_CHECK(smem <= 99 * 1024, "K too large for SMEM (first pass)");
-    if (smem > 48 * 1024) {
-        cudaFuncSetAttribute(fp8_gemv_raw_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    }
-
-    fp8_gemv_raw_kernel<<<blocks, threads, smem>>>(
+    fp8_gemv_raw_kernel<<<blocks, threads>>>(
         reinterpret_cast<const uint4*>(W.data_ptr<uint8_t>()),
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
