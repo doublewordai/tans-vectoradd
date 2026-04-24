@@ -75,7 +75,37 @@ def test_fused_gemv_matches_raw_gemv() -> None:
     assert torch.equal(fused, raw)
 
 
+def test_fused_batch_gemv_matches_raw_gemv() -> None:
+    M, K = 16, 512
+    seg_per_row = 32
+    W = finite_fp8_bytes((M, K), seed=3)
+    x = torch.randn(8, K, dtype=torch.float16, device="cuda")
+
+    W_seg = W.reshape(M, seg_per_row, K // seg_per_row).reshape(
+        M * seg_per_row, K // seg_per_row
+    )
+    exp_freqs = quantize_freqs(np.array(QWEN3_14B_FP8_EXP, dtype=np.float64))
+    comp, states, offsets, sm, pair_freqs = encode(W_seg, exp_freqs, tile=8)
+    sfc = build_sfc(pair_freqs)
+
+    W_cuda = W.cuda()
+    for B in (2, 4, 8):
+        raw = torch.stack([fp8_gemv_raw(W_cuda, x[b]) for b in range(B)])
+        fused = fp8_gemv_fused(
+            comp.cuda(),
+            offsets.cuda(),
+            states.cuda(),
+            sm.cuda(),
+            sfc,
+            x[:B].contiguous(),
+            K,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(fused, raw), B
+
+
 if __name__ == "__main__":
     test_raw_gemv_matches_torch_reference()
     test_fused_gemv_matches_raw_gemv()
+    test_fused_batch_gemv_matches_raw_gemv()
     print("GEMV correctness tests passed.")

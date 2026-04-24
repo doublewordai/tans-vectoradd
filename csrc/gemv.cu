@@ -487,6 +487,140 @@ __global__ void fp8_gemv_fused_rpt2_kernel(
     }
 }
 
+template <int EPB, int TILE, int B>
+__global__ void fp8_gemv_fused_batch_kernel(
+    const uint32_t* __restrict__ W_compressed,
+    const int32_t*  __restrict__ W_offsets,
+    const uint32_t* __restrict__ W_states,
+    const uint8_t*  __restrict__ W_sm_tiled,   // [n_tiles, M*SEG_PER_ROW, TILE]
+    const uint32_t* __restrict__ sfc,
+    const __half*   __restrict__ x,            // [B, K]
+    __half*         __restrict__ y,            // [B, M]
+    int M, int K)
+{
+    constexpr int EW = BLOCK_STREAMS;
+    constexpr int ROWS_PER_EB = EW / SEG_PER_ROW;
+    constexpr int X_TILE_ELEMS = SEG_PER_ROW * TILE * 2;
+    static_assert(TILE % 8 == 0, "TILE must be a multiple of 8");
+    static_assert(EW % SEG_PER_ROW == 0, "BLOCK_STREAMS must be divisible by SEG_PER_ROW");
+
+    extern __shared__ uint8_t smem_raw[];
+    __half* x_smem = reinterpret_cast<__half*>(smem_raw);
+
+    int enc_group = threadIdx.x / EW;
+    int tid       = threadIdx.x % EW;
+    int enc       = EPB * (int)blockIdx.x + enc_group;
+
+    int row_in_eb = tid / SEG_PER_ROW;
+    int seg_idx   = tid % SEG_PER_ROW;
+    int m         = enc * ROWS_PER_EB + row_in_eb;
+    int32_t stream_id = enc * EW + tid;
+    bool active = m < M;
+
+    RansCtx ctx;
+    if (active) {
+        int32_t base = W_offsets[enc], next = W_offsets[enc+1];
+        int G = (next - base) / (EW * 4);
+        ctx.x = W_states[stream_id];
+        CTX_SET_SLAB_AVAIL(ctx, G, 0);
+        ctx.buf_hi = 0; ctx.buf_lo = 0;
+        ctx.block_base_u32 = base / 4;
+    }
+    unsigned active_mask = __ballot_sync(0xFFFFFFFF, active);
+    int N_seg = K / SEG_PER_ROW;
+    int n_pairs = N_seg / 2;
+    int n_tiles_total = n_pairs / TILE;
+    int64_t n_streams = (int64_t)M * SEG_PER_ROW;
+
+    float acc[B];
+    #pragma unroll
+    for (int b = 0; b < B; b++) {
+        acc[b] = 0.0f;
+    }
+
+    for (int tile_idx = 0; tile_idx < n_tiles_total; tile_idx++) {
+        for (int i = threadIdx.x; i < B * X_TILE_ELEMS; i += blockDim.x) {
+            int b = i / X_TILE_ELEMS;
+            int local = i - b * X_TILE_ELEMS;
+            int s = local / (TILE * 2);
+            int k = local - s * (TILE * 2);
+            x_smem[i] = x[(int64_t)b * K + s * N_seg + tile_idx * TILE * 2 + k];
+        }
+        __syncthreads();
+
+        if (active) {
+        {
+            bool need = (CTX_BUF_AVAIL(ctx) == 0);
+            if (__ballot_sync(active_mask, need)) {
+                if (need) { REFILL_BUF(ctx, W_compressed, EW, tid); }
+            }
+        }
+
+        int64_t sm_base = ((int64_t)tile_idx * n_streams + stream_id) * (int64_t)TILE;
+        constexpr int SM_CHUNKS = TILE / 8;
+        uint64_t sm_chunks[SM_CHUNKS];
+        #pragma unroll
+        for (int c = 0; c < SM_CHUNKS; c++) {
+            sm_chunks[c] = *reinterpret_cast<const uint64_t*>(
+                W_sm_tiled + sm_base + c * 8);
+        }
+
+        #pragma unroll
+        for (int t = 0; t < TILE; t++) {
+            uint32_t ent = __ldg(sfc + (ctx.x & (M_SIZE-1)));
+            uint8_t sym = ent & 0xFF;
+            uint32_t f = (ent >> 8) & 0xFFF, c = (ent >> 20) & 0xFFF;
+            uint32_t sl = ctx.x & (M_SIZE-1);
+            ctx.x = (ctx.x >> M_LOG) * f + (sl - c);
+            bool need = (ctx.x < L_LOW);
+            if (need && CTX_BUF_AVAIL(ctx) == 0) {
+                REFILL_BUF(ctx, W_compressed, EW, tid);
+            }
+            uint32_t xr = (ctx.x << 16) | (ctx.buf_hi >> 16);
+            uint32_t bh = (ctx.buf_hi << 16) | (ctx.buf_lo >> 16);
+            uint32_t bl = ctx.buf_lo << 16;
+            int av = CTX_BUF_AVAIL(ctx) - 1;
+            ctx.x      = need ? xr : ctx.x;
+            ctx.buf_hi = need ? bh : ctx.buf_hi;
+            ctx.buf_lo = need ? bl : ctx.buf_lo;
+            CTX_SET_SLAB_AVAIL(ctx, CTX_SLAB_IDX(ctx),
+                               need ? av : CTX_BUF_AVAIL(ctx));
+
+            uint8_t sm_val = (uint8_t)(sm_chunks[t / 8] >> ((t % 8) * 8));
+            uint8_t w0_b = ((sm_val & 8) << 4) | ((sym >> 4) << 3) | (sm_val & 7);
+            uint8_t w1_b = (((sm_val >> 4) & 8) << 4) | ((sym & 0xF) << 3) | ((sm_val >> 4) & 7);
+            __nv_fp8x2_e4m3 w_pair;
+            w_pair.__x = (__nv_fp8x2_storage_t)((uint16_t)w0_b | ((uint16_t)w1_b << 8));
+            float2 wf = static_cast<float2>(w_pair);
+            int x_base = seg_idx * TILE * 2 + t * 2;
+
+            #pragma unroll
+            for (int b = 0; b < B; b++) {
+                const __half* x_tile = x_smem + b * X_TILE_ELEMS;
+                acc[b] += wf.x * __half2float(x_tile[x_base]);
+                acc[b] += wf.y * __half2float(x_tile[x_base + 1]);
+            }
+        }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int offset = SEG_PER_ROW / 2; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int b = 0; b < B; b++) {
+            acc[b] += __shfl_xor_sync(0xFFFFFFFF, acc[b], offset);
+        }
+    }
+
+    if (active && seg_idx == 0) {
+        #pragma unroll
+        for (int b = 0; b < B; b++) {
+            y[(int64_t)b * M + m] = __float2half(acc[b]);
+        }
+    }
+}
+
 torch::Tensor fp8_gemv_fused(
     torch::Tensor W_compressed, torch::Tensor W_offsets, torch::Tensor W_states,
     torch::Tensor W_sm_tiled,
@@ -496,7 +630,11 @@ torch::Tensor fp8_gemv_fused(
 {
     TORCH_CHECK(W_compressed.is_cuda() && W_compressed.dtype() == torch::kUInt8);
     TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf);
-    TORCH_CHECK((int64_t)x.size(0) == K);
+    TORCH_CHECK(x.dim() == 1 || x.dim() == 2, "x must have shape [K] or [B, K]");
+    int64_t B = (x.dim() == 1) ? 1 : x.size(0);
+    int64_t x_k = (x.dim() == 1) ? x.size(0) : x.size(1);
+    TORCH_CHECK(x_k == K);
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
 
     int64_t n_streams = W_states.numel();
     TORCH_CHECK(n_streams % SEG_PER_ROW == 0, "n_streams must be divisible by SEG_PER_ROW");
@@ -517,8 +655,11 @@ torch::Tensor fp8_gemv_fused(
     int N_seg = (int)K / SEG_PER_ROW;
     TORCH_CHECK(N_seg % (2 * tile) == 0, "N_seg must be a multiple of 2*RANS_GEMV_TILE");
 
-    auto y = torch::empty({M},
-        torch::TensorOptions().dtype(torch::kHalf).device(W_compressed.device()));
+    auto y = (x.dim() == 1)
+        ? torch::empty({M},
+            torch::TensorOptions().dtype(torch::kHalf).device(W_compressed.device()))
+        : torch::empty({B, M},
+            torch::TensorOptions().dtype(torch::kHalf).device(W_compressed.device()));
 
     size_t smem_bytes = SEG_PER_ROW * tile * 2 * sizeof(__half);
     TORCH_CHECK(smem_bytes <= 99 * 1024, "dynamic SMEM request is too large");
@@ -556,7 +697,81 @@ torch::Tensor fp8_gemv_fused(
             (int)M, (int)K);                                                          \
 } while (0)
 
-    if (rpt == 2) {
+#define LAUNCH_FUSED_BATCH(EPB_VALUE, TILE_VALUE, B_VALUE) do {                       \
+    size_t batch_smem_bytes = (size_t)(B_VALUE) * SEG_PER_ROW * (TILE_VALUE) * 2 * sizeof(__half); \
+    if (batch_smem_bytes > 48 * 1024) {                                               \
+        cudaFuncSetAttribute(fp8_gemv_fused_batch_kernel<EPB_VALUE, TILE_VALUE, B_VALUE>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)batch_smem_bytes);      \
+    }                                                                                 \
+    fp8_gemv_fused_batch_kernel<EPB_VALUE, TILE_VALUE, B_VALUE>                       \
+        <<<n_enc_blocks / (EPB_VALUE), BLOCK_STREAMS * (EPB_VALUE), batch_smem_bytes>>>( \
+            reinterpret_cast<const uint32_t*>(W_compressed.data_ptr<uint8_t>()),      \
+            W_offsets.data_ptr<int32_t>(),                                            \
+            reinterpret_cast<const uint32_t*>(W_states.data_ptr<int32_t>()),          \
+            W_sm_tiled.data_ptr<uint8_t>(),                                           \
+            reinterpret_cast<const uint32_t*>(sfc_table.data_ptr<int32_t>()),         \
+            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                  \
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),                        \
+            (int)M, (int)K);                                                          \
+} while (0)
+
+    if (x.dim() == 2) {
+        TORCH_CHECK(B == 2 || B == 4 || B == 8, "batched x currently supports B in {2, 4, 8}");
+        size_t batch_smem_bytes = (size_t)B * SEG_PER_ROW * tile * 2 * sizeof(__half);
+        TORCH_CHECK(batch_smem_bytes <= 99 * 1024, "dynamic SMEM request is too large");
+        if (B == 2) {
+            if (tile == 8) {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 8, 2); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 8, 2); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 8, 2); }
+                else               { LAUNCH_FUSED_BATCH(8, 8, 2); }
+            } else if (tile == 16) {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 16, 2); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 16, 2); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 16, 2); }
+                else               { LAUNCH_FUSED_BATCH(8, 16, 2); }
+            } else {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 32, 2); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 32, 2); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 32, 2); }
+                else               { LAUNCH_FUSED_BATCH(8, 32, 2); }
+            }
+        } else if (B == 4) {
+            if (tile == 8) {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 8, 4); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 8, 4); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 8, 4); }
+                else               { LAUNCH_FUSED_BATCH(8, 8, 4); }
+            } else if (tile == 16) {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 16, 4); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 16, 4); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 16, 4); }
+                else               { LAUNCH_FUSED_BATCH(8, 16, 4); }
+            } else {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 32, 4); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 32, 4); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 32, 4); }
+                else               { LAUNCH_FUSED_BATCH(8, 32, 4); }
+            }
+        } else {
+            if (tile == 8) {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 8, 8); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 8, 8); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 8, 8); }
+                else               { LAUNCH_FUSED_BATCH(8, 8, 8); }
+            } else if (tile == 16) {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 16, 8); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 16, 8); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 16, 8); }
+                else               { LAUNCH_FUSED_BATCH(8, 16, 8); }
+            } else {
+                if      (epb == 1) { LAUNCH_FUSED_BATCH(1, 32, 8); }
+                else if (epb == 2) { LAUNCH_FUSED_BATCH(2, 32, 8); }
+                else if (epb == 4) { LAUNCH_FUSED_BATCH(4, 32, 8); }
+                else               { LAUNCH_FUSED_BATCH(8, 32, 8); }
+            }
+        }
+    } else if (rpt == 2) {
         if (tile == 8) {
             if      (epb == 1) { LAUNCH_FUSED_RPT2(1, 8); }
             else if (epb == 2) { LAUNCH_FUSED_RPT2(2, 8); }
@@ -594,6 +809,7 @@ torch::Tensor fp8_gemv_fused(
 
 #undef LAUNCH_FUSED
 #undef LAUNCH_FUSED_RPT2
+#undef LAUNCH_FUSED_BATCH
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
