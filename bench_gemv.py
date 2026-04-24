@@ -53,6 +53,7 @@ def bench_fused(
     *,
     epb: int | None = None,
     tile: int | None = None,
+    rpt: int | None = None,
 ) -> tuple[float, float]:
     encode_tile = 8 if tile is None else tile
     exp_freqs = quantize_freqs(np.array(QWEN3_14B_FP8_EXP, dtype=np.float64))
@@ -79,6 +80,7 @@ def bench_fused(
 
     old_epb = os.environ.get("RANS_GEMV_EPB")
     old_tile = os.environ.get("RANS_GEMV_TILE")
+    old_rpt = os.environ.get("RANS_GEMV_RPT")
     if epb is None:
         os.environ.pop("RANS_GEMV_EPB", None)
     else:
@@ -87,6 +89,10 @@ def bench_fused(
         os.environ.pop("RANS_GEMV_TILE", None)
     else:
         os.environ["RANS_GEMV_TILE"] = str(tile)
+    if rpt is None:
+        os.environ.pop("RANS_GEMV_RPT", None)
+    else:
+        os.environ["RANS_GEMV_RPT"] = str(rpt)
 
     def _run():
         fp8_gemv_fused(W_comp, W_offsets, W_states, W_sm, sfc_t, x, K)
@@ -105,6 +111,10 @@ def bench_fused(
             os.environ.pop("RANS_GEMV_TILE", None)
         else:
             os.environ["RANS_GEMV_TILE"] = old_tile
+        if old_rpt is None:
+            os.environ.pop("RANS_GEMV_RPT", None)
+        else:
+            os.environ["RANS_GEMV_RPT"] = old_rpt
     return ms, comp_ratio
 
 
@@ -135,20 +145,21 @@ def run_variants(M: int, K: int) -> None:
     raw_ms = bench_raw(M, K)
     raw_bytes = M * K
     print(f"\nVariant sweep for M={M}, K={K} (raw {raw_ms:.3f} ms)")
-    print(f"{'EPB':>3s} {'tile':>4s} {'fused_ms':>9s} {'fused_GB/s':>11s} "
+    print(f"{'RPT':>3s} {'EPB':>3s} {'tile':>4s} {'fused_ms':>9s} {'fused_GB/s':>11s} "
           f"{'raw/fused':>9s} {'comp':>5s}")
-    print("-" * 54)
-    for tile in (8, 16, 32):
-        n_pairs_per_segment = K // SEG_PER_ROW // 2
-        if n_pairs_per_segment % tile != 0:
-            print(f"{'-':>3s} {tile:>4d} {'skip':>8s} "
-                  f"{'n_pairs%tile':>10s} {'':>9s} {'':>5s}")
-            continue
-        for epb in (1, 2, 4, 8):
-            fused_ms, comp_ratio = bench_fused(M, K, epb=epb, tile=tile)
-            fused_bw = raw_bytes / fused_ms / 1e6
-            print(f"{epb:>3d} {tile:>4d} {fused_ms:>8.3f} {fused_bw:>10.1f} "
-                  f"{raw_ms / fused_ms:>8.3f}x {comp_ratio:>4.2f}x")
+    print("-" * 59)
+    for rpt in (1, 2):
+        for tile in (8, 16, 32):
+            n_pairs_per_segment = K // SEG_PER_ROW // 2
+            if n_pairs_per_segment % tile != 0:
+                print(f"{rpt:>3d} {'-':>3s} {tile:>4d} {'skip':>8s} "
+                      f"{'n_pairs%tile':>10s} {'':>9s} {'':>5s}")
+                continue
+            for epb in (1, 2, 4, 8):
+                fused_ms, comp_ratio = bench_fused(M, K, epb=epb, tile=tile, rpt=rpt)
+                fused_bw = raw_bytes / fused_ms / 1e6
+                print(f"{rpt:>3d} {epb:>3d} {tile:>4d} {fused_ms:>8.3f} {fused_bw:>10.1f} "
+                      f"{raw_ms / fused_ms:>8.3f}x {comp_ratio:>4.2f}x")
 
 
 def main() -> None:
@@ -157,6 +168,11 @@ def main() -> None:
         "--variants",
         action="store_true",
         help="sweep RANS_GEMV_EPB and RANS_GEMV_TILE on one representative shape",
+    )
+    parser.add_argument(
+        "--skip-default",
+        action="store_true",
+        help="only run the explicitly requested targeted sweeps",
     )
     parser.add_argument("--variant-m", type=int, default=5120)
     parser.add_argument("--variant-k", type=int, default=5120)
@@ -170,7 +186,8 @@ def main() -> None:
         ( 5120,  8192),
     ]
 
-    run_default(shapes)
+    if not args.skip_default:
+        run_default(shapes)
     if args.variants:
         run_variants(args.variant_m, args.variant_k)
 

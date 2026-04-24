@@ -44,6 +44,10 @@ int choose_auto_epb(int64_t M, int64_t n_enc_blocks) {
     return epb;
 }
 
+int choose_auto_rpt(int64_t M) {
+    return (M >= 8192) ? 2 : 1;
+}
+
 struct RansCtx {
     uint32_t x;
     int      slab_avail;   // (slab_idx << 3) | buf_avail
@@ -161,6 +165,74 @@ torch::Tensor fp8_gemv_raw(torch::Tensor W, torch::Tensor x) {
 
 constexpr int SEG_PER_ROW = 32;
 
+__device__ __forceinline__ void refill_rans_buf(
+    const uint32_t* __restrict__ W_compressed,
+    int tid,
+    int& slab_idx,
+    int& buf_avail,
+    uint32_t& buf_hi,
+    uint32_t& buf_lo,
+    int32_t block_base_u32)
+{
+    constexpr int EW = BLOCK_STREAMS;
+    int refill_sl = slab_idx - 2;
+    int32_t off = block_base_u32 + refill_sl * EW + tid;
+    buf_lo = W_compressed[off];
+    buf_hi = W_compressed[off + EW];
+    slab_idx = refill_sl;
+    buf_avail = 4;
+}
+
+template <int TILE>
+__device__ __forceinline__ void decode_accumulate_symbol(
+    const uint32_t* __restrict__ W_compressed,
+    const uint32_t* __restrict__ sfc,
+    const __half* __restrict__ x_smem,
+    int tid,
+    int seg_idx,
+    int t,
+    uint8_t sm_val,
+    uint32_t& rans_x,
+    uint32_t& buf_hi,
+    uint32_t& buf_lo,
+    int& slab_idx,
+    int& buf_avail,
+    int32_t block_base_u32,
+    float& acc)
+{
+    uint32_t x0 = rans_x;
+    uint32_t sl = x0 & (M_SIZE - 1);
+    uint32_t ent = __ldg(sfc + sl);
+    uint8_t sym = ent & 0xFF;
+    uint32_t f = (ent >> 8) & 0xFFF;
+    uint32_t c = (ent >> 20) & 0xFFF;
+    uint32_t x_new = (x0 >> M_LOG) * f + (sl - c);
+    bool need = x_new < L_LOW;
+    if (need && buf_avail == 0) {
+        refill_rans_buf(W_compressed, tid, slab_idx, buf_avail,
+                        buf_hi, buf_lo, block_base_u32);
+    }
+    uint32_t xr = (x_new << 16) | (buf_hi >> 16);
+    uint32_t bh = (buf_hi << 16) | (buf_lo >> 16);
+    uint32_t bl = buf_lo << 16;
+    int av = buf_avail - 1;
+    rans_x = need ? xr : x_new;
+    buf_hi = need ? bh : buf_hi;
+    buf_lo = need ? bl : buf_lo;
+    buf_avail = need ? av : buf_avail;
+
+    uint8_t w0_b = ((sm_val & 8) << 4) | ((sym >> 4) << 3) | (sm_val & 7);
+    uint8_t w1_b = (((sm_val >> 4) & 8) << 4) | ((sym & 0xF) << 3) | ((sm_val >> 4) & 7);
+    __nv_fp8_e4m3 w0;
+    __nv_fp8_e4m3 w1;
+    w0.__x = (__nv_fp8_storage_t)w0_b;
+    w1.__x = (__nv_fp8_storage_t)w1_b;
+    float2 wf = make_float2((float)w0, (float)w1);
+
+    acc += wf.x * __half2float(x_smem[seg_idx * TILE * 2 + t * 2]);
+    acc += wf.y * __half2float(x_smem[seg_idx * TILE * 2 + t * 2 + 1]);
+}
+
 template <int EPB, int TILE>
 __global__ void fp8_gemv_fused_kernel(
     const uint32_t* __restrict__ W_compressed,
@@ -200,7 +272,6 @@ __global__ void fp8_gemv_fused_kernel(
         ctx.block_base_u32 = base / 4;
     }
     unsigned active_mask = __ballot_sync(0xFFFFFFFF, active);
-
     int N_seg = K / SEG_PER_ROW;
     int n_pairs = N_seg / 2;
     int n_tiles_total = n_pairs / TILE;
@@ -279,6 +350,143 @@ __global__ void fp8_gemv_fused_kernel(
         y[m] = __float2half(acc);
 }
 
+template <int EPB, int TILE>
+__global__ void fp8_gemv_fused_rpt2_kernel(
+    const uint32_t* __restrict__ W_compressed,
+    const int32_t*  __restrict__ W_offsets,
+    const uint32_t* __restrict__ W_states,
+    const uint8_t*  __restrict__ W_sm_tiled,   // [n_tiles, M*SEG_PER_ROW, TILE]
+    const uint32_t* __restrict__ sfc,
+    const __half*   __restrict__ x,            // [K]
+    __half*         __restrict__ y,            // [M]
+    int M, int K)
+{
+    constexpr int EW = BLOCK_STREAMS;
+    constexpr int ROWS_PER_EB = EW / SEG_PER_ROW;  // 4
+    constexpr int RPT = 2;
+    constexpr int THREADS_PER_EB = EW / RPT;
+    static_assert(TILE % 8 == 0, "TILE must be a multiple of 8");
+    static_assert(ROWS_PER_EB % RPT == 0, "RPT must divide rows per encoder block");
+
+    extern __shared__ uint8_t smem_raw[];
+    __half* x_smem = reinterpret_cast<__half*>(smem_raw);
+
+    int enc_group = threadIdx.x / THREADS_PER_EB;
+    int local_tid = threadIdx.x % THREADS_PER_EB;
+    int enc       = EPB * (int)blockIdx.x + enc_group;
+
+    int row_pair = local_tid / SEG_PER_ROW;      // 0..1
+    int seg_idx  = local_tid % SEG_PER_ROW;
+    int row0     = row_pair * RPT;
+    int row1     = row0 + 1;
+    int tid0     = row0 * SEG_PER_ROW + seg_idx;
+    int tid1     = row1 * SEG_PER_ROW + seg_idx;
+    int m0       = enc * ROWS_PER_EB + row0;
+    int m1       = m0 + 1;
+    int32_t stream0 = enc * EW + tid0;
+    int32_t stream1 = enc * EW + tid1;
+    bool active0 = m0 < M;
+    bool active1 = m1 < M;
+    bool active = active0 || active1;
+
+    uint32_t rans_x0 = 0, rans_x1 = 0;
+    uint32_t buf_hi0 = 0, buf_hi1 = 0;
+    uint32_t buf_lo0 = 0, buf_lo1 = 0;
+    int slab_idx0 = 0, slab_idx1 = 0;
+    int buf_avail0 = 0, buf_avail1 = 0;
+    int32_t block_base_u32 = 0;
+    if (active) {
+        int32_t base = W_offsets[enc], next = W_offsets[enc+1];
+        int G = (next - base) / (EW * 4);
+        block_base_u32 = base / 4;
+        if (active0) {
+            rans_x0 = W_states[stream0];
+            slab_idx0 = G;
+        }
+        if (active1) {
+            rans_x1 = W_states[stream1];
+            slab_idx1 = G;
+        }
+    }
+
+    int N_seg = K / SEG_PER_ROW;
+    int n_pairs = N_seg / 2;
+    int n_tiles_total = n_pairs / TILE;
+    int64_t n_streams = (int64_t)M * SEG_PER_ROW;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (int tile_idx = 0; tile_idx < n_tiles_total; tile_idx++) {
+        for (int i = threadIdx.x; i < SEG_PER_ROW * TILE * 2; i += blockDim.x) {
+            int s = i / (TILE * 2);
+            int k = i - s * (TILE * 2);
+            x_smem[i] = x[s * N_seg + tile_idx * TILE * 2 + k];
+        }
+        __syncthreads();
+
+        if (active0 && buf_avail0 == 0) {
+            refill_rans_buf(W_compressed, tid0, slab_idx0, buf_avail0,
+                            buf_hi0, buf_lo0, block_base_u32);
+        }
+        if (active1 && buf_avail1 == 0) {
+            refill_rans_buf(W_compressed, tid1, slab_idx1, buf_avail1,
+                            buf_hi1, buf_lo1, block_base_u32);
+        }
+
+        int64_t tile_base = (int64_t)tile_idx * n_streams;
+        int64_t sm_base0 = (tile_base + stream0) * (int64_t)TILE;
+        int64_t sm_base1 = (tile_base + stream1) * (int64_t)TILE;
+        constexpr int SM_CHUNKS = TILE / 8;
+        uint64_t sm_chunks0[SM_CHUNKS];
+        uint64_t sm_chunks1[SM_CHUNKS];
+        if (active0) {
+            #pragma unroll
+            for (int c = 0; c < SM_CHUNKS; c++) {
+                sm_chunks0[c] = *reinterpret_cast<const uint64_t*>(
+                    W_sm_tiled + sm_base0 + c * 8);
+            }
+        }
+        if (active1) {
+            #pragma unroll
+            for (int c = 0; c < SM_CHUNKS; c++) {
+                sm_chunks1[c] = *reinterpret_cast<const uint64_t*>(
+                    W_sm_tiled + sm_base1 + c * 8);
+            }
+        }
+
+        #pragma unroll
+        for (int t = 0; t < TILE; t++) {
+            if (active0) {
+                uint8_t sm_val0 = (uint8_t)(sm_chunks0[t / 8] >> ((t % 8) * 8));
+                decode_accumulate_symbol<TILE>(
+                    W_compressed, sfc, x_smem, tid0, seg_idx, t, sm_val0,
+                    rans_x0, buf_hi0, buf_lo0, slab_idx0, buf_avail0,
+                    block_base_u32, acc0);
+            }
+            if (active1) {
+                uint8_t sm_val1 = (uint8_t)(sm_chunks1[t / 8] >> ((t % 8) * 8));
+                decode_accumulate_symbol<TILE>(
+                    W_compressed, sfc, x_smem, tid1, seg_idx, t, sm_val1,
+                    rans_x1, buf_hi1, buf_lo1, slab_idx1, buf_avail1,
+                    block_base_u32, acc1);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int offset = SEG_PER_ROW / 2; offset > 0; offset >>= 1) {
+        acc0 += __shfl_xor_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_xor_sync(0xFFFFFFFF, acc1, offset);
+    }
+
+    if (seg_idx == 0) {
+        if (active0) y[m0] = __float2half(acc0);
+        if (active1) y[m1] = __float2half(acc1);
+    }
+}
+
 torch::Tensor fp8_gemv_fused(
     torch::Tensor W_compressed, torch::Tensor W_offsets, torch::Tensor W_states,
     torch::Tensor W_sm_tiled,
@@ -296,12 +504,15 @@ torch::Tensor fp8_gemv_fused(
     int64_t n_enc_blocks = n_streams / BLOCK_STREAMS;
     bool epb_env_set = getenv_is_set("RANS_GEMV_EPB");
     bool tile_env_set = getenv_is_set("RANS_GEMV_TILE");
+    bool rpt_env_set = getenv_is_set("RANS_GEMV_RPT");
     int epb = epb_env_set ? getenv_int("RANS_GEMV_EPB", 2) : choose_auto_epb(M, n_enc_blocks);
     int tile = tile_env_set ? getenv_int("RANS_GEMV_TILE", 8) : 8;
+    int rpt = rpt_env_set ? getenv_int("RANS_GEMV_RPT", 1) : choose_auto_rpt(M);
     TORCH_CHECK(epb == 1 || epb == 2 || epb == 4 || epb == 8,
                 "RANS_GEMV_EPB must be one of 1, 2, 4, 8");
     TORCH_CHECK(tile == 8 || tile == 16 || tile == 32,
                 "RANS_GEMV_TILE must be one of 8, 16, 32");
+    TORCH_CHECK(rpt == 1 || rpt == 2, "RANS_GEMV_RPT must be one of 1, 2");
     TORCH_CHECK(n_enc_blocks % epb == 0, "n_enc_blocks must be a multiple of RANS_GEMV_EPB");
     int N_seg = (int)K / SEG_PER_ROW;
     TORCH_CHECK(N_seg % (2 * tile) == 0, "N_seg must be a multiple of 2*RANS_GEMV_TILE");
@@ -328,24 +539,61 @@ torch::Tensor fp8_gemv_fused(
             (int)M, (int)K);                                                          \
 } while (0)
 
-    if (tile == 8) {
-        if      (epb == 1) { LAUNCH_FUSED(1, 8); }
-        else if (epb == 2) { LAUNCH_FUSED(2, 8); }
-        else if (epb == 4) { LAUNCH_FUSED(4, 8); }
-        else               { LAUNCH_FUSED(8, 8); }
-    } else if (tile == 16) {
-        if      (epb == 1) { LAUNCH_FUSED(1, 16); }
-        else if (epb == 2) { LAUNCH_FUSED(2, 16); }
-        else if (epb == 4) { LAUNCH_FUSED(4, 16); }
-        else               { LAUNCH_FUSED(8, 16); }
+#define LAUNCH_FUSED_RPT2(EPB_VALUE, TILE_VALUE) do {                                 \
+    if (smem_bytes > 48 * 1024) {                                                     \
+        cudaFuncSetAttribute(fp8_gemv_fused_rpt2_kernel<EPB_VALUE, TILE_VALUE>,       \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);            \
+    }                                                                                 \
+    fp8_gemv_fused_rpt2_kernel<EPB_VALUE, TILE_VALUE>                                 \
+        <<<n_enc_blocks / (EPB_VALUE), (BLOCK_STREAMS / 2) * (EPB_VALUE), smem_bytes>>>( \
+            reinterpret_cast<const uint32_t*>(W_compressed.data_ptr<uint8_t>()),      \
+            W_offsets.data_ptr<int32_t>(),                                            \
+            reinterpret_cast<const uint32_t*>(W_states.data_ptr<int32_t>()),          \
+            W_sm_tiled.data_ptr<uint8_t>(),                                           \
+            reinterpret_cast<const uint32_t*>(sfc_table.data_ptr<int32_t>()),         \
+            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                  \
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),                        \
+            (int)M, (int)K);                                                          \
+} while (0)
+
+    if (rpt == 2) {
+        if (tile == 8) {
+            if      (epb == 1) { LAUNCH_FUSED_RPT2(1, 8); }
+            else if (epb == 2) { LAUNCH_FUSED_RPT2(2, 8); }
+            else if (epb == 4) { LAUNCH_FUSED_RPT2(4, 8); }
+            else               { LAUNCH_FUSED_RPT2(8, 8); }
+        } else if (tile == 16) {
+            if      (epb == 1) { LAUNCH_FUSED_RPT2(1, 16); }
+            else if (epb == 2) { LAUNCH_FUSED_RPT2(2, 16); }
+            else if (epb == 4) { LAUNCH_FUSED_RPT2(4, 16); }
+            else               { LAUNCH_FUSED_RPT2(8, 16); }
+        } else {
+            if      (epb == 1) { LAUNCH_FUSED_RPT2(1, 32); }
+            else if (epb == 2) { LAUNCH_FUSED_RPT2(2, 32); }
+            else if (epb == 4) { LAUNCH_FUSED_RPT2(4, 32); }
+            else               { LAUNCH_FUSED_RPT2(8, 32); }
+        }
     } else {
-        if      (epb == 1) { LAUNCH_FUSED(1, 32); }
-        else if (epb == 2) { LAUNCH_FUSED(2, 32); }
-        else if (epb == 4) { LAUNCH_FUSED(4, 32); }
-        else               { LAUNCH_FUSED(8, 32); }
+        if (tile == 8) {
+            if      (epb == 1) { LAUNCH_FUSED(1, 8); }
+            else if (epb == 2) { LAUNCH_FUSED(2, 8); }
+            else if (epb == 4) { LAUNCH_FUSED(4, 8); }
+            else               { LAUNCH_FUSED(8, 8); }
+        } else if (tile == 16) {
+            if      (epb == 1) { LAUNCH_FUSED(1, 16); }
+            else if (epb == 2) { LAUNCH_FUSED(2, 16); }
+            else if (epb == 4) { LAUNCH_FUSED(4, 16); }
+            else               { LAUNCH_FUSED(8, 16); }
+        } else {
+            if      (epb == 1) { LAUNCH_FUSED(1, 32); }
+            else if (epb == 2) { LAUNCH_FUSED(2, 32); }
+            else if (epb == 4) { LAUNCH_FUSED(4, 32); }
+            else               { LAUNCH_FUSED(8, 32); }
+        }
     }
 
 #undef LAUNCH_FUSED
+#undef LAUNCH_FUSED_RPT2
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
