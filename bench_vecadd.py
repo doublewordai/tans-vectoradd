@@ -47,9 +47,8 @@ def bench_fused(n_bytes: int, N: int, ns: int) -> dict:
     fp8_a = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
     fp8_b = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
 
-    tile = 8 if ns in (704, 835) else 0
-    ca, sa, oa, sma, pf = encode(fp8_a, exp_freqs, tile=tile)
-    cb, sb, ob, smb, _  = encode(fp8_b, exp_freqs, tile=tile)
+    ca, sa, oa, sma, pf = encode(fp8_a, exp_freqs, tile=8)
+    cb, sb, ob, smb, _  = encode(fp8_b, exp_freqs, tile=8)
 
     # Build sfc table from pair_freqs
     pf_np = pf.numpy().astype(np.int32)
@@ -98,9 +97,7 @@ def main() -> None:
         (1 << 30, "1 GiB"),
     ]
     configs = [
-        (504, "twopass"),
-        (704, "tiled"),
-        (835, "tiled+tbr"),
+        (835, "fused"),
     ]
 
     for N in [128, 256, 512, 1024, 2048]:
