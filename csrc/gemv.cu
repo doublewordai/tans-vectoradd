@@ -8,7 +8,7 @@
 //   BLOCK_STREAMS=128 rows per encoder block.
 //   sm is tiled as [n_tiles, M, TILE] for DRAM row hits.
 //
-// x is loaded once into SMEM and shared across all threads in a block.
+// x is read directly from global memory through the read-only cache path.
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAException.h>
@@ -16,6 +16,7 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <cstdlib>
 
 // rANS constants — must match the encoder and vecadd.cu.
 namespace {
@@ -23,6 +24,12 @@ constexpr int      M_LOG         = 12;
 constexpr uint32_t M_SIZE        = 1u << M_LOG;
 constexpr uint32_t L_LOW         = 1u << 16;
 constexpr int      BLOCK_STREAMS = 128;
+
+int getenv_int(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return default_value;
+    return std::atoi(value);
+}
 
 struct RansCtx {
     uint32_t x;
@@ -159,13 +166,9 @@ __global__ void fp8_gemv_fused_kernel(
 
     extern __shared__ uint8_t smem_raw[];
     uint32_t* sfc_smem = reinterpret_cast<uint32_t*>(smem_raw);
-    uint8_t*  decoded  = smem_raw + 4096 * sizeof(uint32_t);
-    __half*   x_smem   = reinterpret_cast<__half*>(decoded + TILE * blockDim.x);
 
     for (int i = threadIdx.x; i < 4096; i += blockDim.x)
         sfc_smem[i] = sfc[i];
-    for (int i = threadIdx.x; i < K; i += blockDim.x)
-        x_smem[i] = x[i];
     __syncthreads();
 
     int enc_group = threadIdx.x / EW;
@@ -235,25 +238,18 @@ __global__ void fp8_gemv_fused_kernel(
             ctx.buf_lo = need ? bl : ctx.buf_lo;
             CTX_SET_SLAB_AVAIL(ctx, CTX_SLAB_IDX(ctx),
                                need ? av : CTX_BUF_AVAIL(ctx));
-            decoded[t * blockDim.x + threadIdx.x] = sym;
-        }
-        __syncthreads();
 
-        #pragma unroll
-        for (int t = 0; t < TILE; t++) {
-            uint8_t sym    = decoded[t * blockDim.x + threadIdx.x];
             uint8_t sm_val = (uint8_t)(sm_chunks[t / 8] >> ((t % 8) * 8));
             uint8_t w0_b = ((sm_val & 8) << 4) | ((sym >> 4) << 3) | (sm_val & 7);
             uint8_t w1_b = (((sm_val >> 4) & 8) << 4) | ((sym & 0xF) << 3) | ((sm_val >> 4) & 7);
-            __nv_fp8_e4m3 w0, w1;
-            memcpy(&w0, &w0_b, 1);
-            memcpy(&w1, &w1_b, 1);
+            __nv_fp8x2_e4m3 w_pair;
+            w_pair.__x = (__nv_fp8x2_storage_t)((uint16_t)w0_b | ((uint16_t)w1_b << 8));
+            float2 wf = static_cast<float2>(w_pair);
 
             int k_in_seg = (tile_idx * TILE + t) * 2;
-            acc += float(w0) * __half2float(x_smem[x_base + k_in_seg]);
-            acc += float(w1) * __half2float(x_smem[x_base + k_in_seg + 1]);
+            acc += wf.x * __half2float(__ldg(x + x_base + k_in_seg));
+            acc += wf.y * __half2float(__ldg(x + x_base + k_in_seg + 1));
         }
-        __syncthreads();
     }
 
     // Warp-level reduction: 32 threads per row → single sum.
@@ -280,32 +276,57 @@ torch::Tensor fp8_gemv_fused(
     TORCH_CHECK(n_streams % SEG_PER_ROW == 0, "n_streams must be divisible by SEG_PER_ROW");
     int64_t M = n_streams / SEG_PER_ROW;
     int64_t n_enc_blocks = n_streams / BLOCK_STREAMS;
-    constexpr int E = 4, T = 8;
-    TORCH_CHECK(n_enc_blocks % E == 0, "n_enc_blocks must be a multiple of EPB=4");
+    int epb = getenv_int("RANS_GEMV_EPB", 2);
+    int tile = getenv_int("RANS_GEMV_TILE", 8);
+    TORCH_CHECK(epb == 1 || epb == 2 || epb == 4 || epb == 8,
+                "RANS_GEMV_EPB must be one of 1, 2, 4, 8");
+    TORCH_CHECK(tile == 8 || tile == 16 || tile == 32,
+                "RANS_GEMV_TILE must be one of 8, 16, 32");
+    TORCH_CHECK(n_enc_blocks % epb == 0, "n_enc_blocks must be a multiple of RANS_GEMV_EPB");
     int N_seg = (int)K / SEG_PER_ROW;
-    TORCH_CHECK(N_seg % (2 * T) == 0, "N_seg must be a multiple of 2*TILE=16");
+    TORCH_CHECK(N_seg % (2 * tile) == 0, "N_seg must be a multiple of 2*RANS_GEMV_TILE");
 
     auto y = torch::empty({M},
         torch::TensorOptions().dtype(torch::kHalf).device(W_compressed.device()));
 
-    size_t smem_bytes = 4096 * 4
-                      + (size_t)T * BLOCK_STREAMS * E
-                      + K * sizeof(__half);
-    TORCH_CHECK(smem_bytes <= 99 * 1024, "K too large for SMEM (first pass)");
-    if (smem_bytes > 48 * 1024) {
-        cudaFuncSetAttribute(fp8_gemv_fused_kernel<E, T>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    size_t smem_bytes = 4096 * 4;
+    TORCH_CHECK(smem_bytes <= 99 * 1024, "dynamic SMEM request is too large");
+#define LAUNCH_FUSED(EPB_VALUE, TILE_VALUE) do {                                      \
+    if (smem_bytes > 48 * 1024) {                                                     \
+        cudaFuncSetAttribute(fp8_gemv_fused_kernel<EPB_VALUE, TILE_VALUE>,            \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);            \
+    }                                                                                 \
+    fp8_gemv_fused_kernel<EPB_VALUE, TILE_VALUE>                                      \
+        <<<n_enc_blocks / (EPB_VALUE), BLOCK_STREAMS * (EPB_VALUE), smem_bytes>>>(    \
+            reinterpret_cast<const uint32_t*>(W_compressed.data_ptr<uint8_t>()),      \
+            W_offsets.data_ptr<int32_t>(),                                            \
+            reinterpret_cast<const uint32_t*>(W_states.data_ptr<int32_t>()),          \
+            W_sm_tiled.data_ptr<uint8_t>(),                                           \
+            reinterpret_cast<const uint32_t*>(sfc_table.data_ptr<int32_t>()),         \
+            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                  \
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),                        \
+            (int)M, (int)K);                                                          \
+} while (0)
+
+    if (tile == 8) {
+        if      (epb == 1) { LAUNCH_FUSED(1, 8); }
+        else if (epb == 2) { LAUNCH_FUSED(2, 8); }
+        else if (epb == 4) { LAUNCH_FUSED(4, 8); }
+        else               { LAUNCH_FUSED(8, 8); }
+    } else if (tile == 16) {
+        if      (epb == 1) { LAUNCH_FUSED(1, 16); }
+        else if (epb == 2) { LAUNCH_FUSED(2, 16); }
+        else if (epb == 4) { LAUNCH_FUSED(4, 16); }
+        else               { LAUNCH_FUSED(8, 16); }
+    } else {
+        if      (epb == 1) { LAUNCH_FUSED(1, 32); }
+        else if (epb == 2) { LAUNCH_FUSED(2, 32); }
+        else if (epb == 4) { LAUNCH_FUSED(4, 32); }
+        else               { LAUNCH_FUSED(8, 32); }
     }
 
-    fp8_gemv_fused_kernel<E, T><<<n_enc_blocks / E, BLOCK_STREAMS * E, smem_bytes>>>(
-        reinterpret_cast<const uint32_t*>(W_compressed.data_ptr<uint8_t>()),
-        W_offsets.data_ptr<int32_t>(),
-        reinterpret_cast<const uint32_t*>(W_states.data_ptr<int32_t>()),
-        W_sm_tiled.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(sfc_table.data_ptr<int32_t>()),
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
-        reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
-        (int)M, (int)K);
+#undef LAUNCH_FUSED
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }

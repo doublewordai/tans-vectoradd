@@ -4,6 +4,9 @@ y = W @ x, W is [M, K] FP8, x is [K] FP16, y is [M] FP16.
 """
 from __future__ import annotations
 
+import argparse
+import os
+
 import numpy as np
 import torch
 import triton.testing
@@ -44,7 +47,7 @@ def bench_raw(M: int, K: int) -> float:
 SEG_PER_ROW = 32
 
 
-def bench_fused(M: int, K: int) -> tuple[float, float]:
+def bench_fused(M: int, K: int, *, epb: int = 2, tile: int = 8) -> tuple[float, float]:
     exp_freqs = quantize_freqs(np.array(QWEN3_14B_FP8_EXP, dtype=np.float64))
     torch.manual_seed(42)
     W_cpu = random_fp8_bytes(M * K, device="cpu").reshape(M, K)
@@ -54,7 +57,7 @@ def bench_fused(M: int, K: int) -> tuple[float, float]:
     N_seg = K // SEG_PER_ROW
     W_seg = W_cpu.reshape(M, SEG_PER_ROW, N_seg).reshape(M * SEG_PER_ROW, N_seg)
 
-    comp, states, offsets, sm, pf = encode(W_seg, exp_freqs, tile=8)
+    comp, states, offsets, sm, pf = encode(W_seg, exp_freqs, tile=tile)
     sfc_t = build_sfc(pf)
 
     W_comp = comp.cuda()
@@ -67,27 +70,34 @@ def bench_fused(M: int, K: int) -> tuple[float, float]:
     comp_bytes = W_comp.numel() + W_sm.numel()
     comp_ratio = raw_bytes / comp_bytes
 
+    old_epb = os.environ.get("RANS_GEMV_EPB")
+    old_tile = os.environ.get("RANS_GEMV_TILE")
+    os.environ["RANS_GEMV_EPB"] = str(epb)
+    os.environ["RANS_GEMV_TILE"] = str(tile)
+
     def _run():
         fp8_gemv_fused(W_comp, W_offsets, W_states, W_sm, sfc_t, x, K)
 
-    for _ in range(5):
-        _run()
-    torch.cuda.synchronize()
-    ms = triton.testing.do_bench(_run, warmup=50, rep=200)
+    try:
+        for _ in range(5):
+            _run()
+        torch.cuda.synchronize()
+        ms = triton.testing.do_bench(_run, warmup=50, rep=200)
+    finally:
+        if old_epb is None:
+            os.environ.pop("RANS_GEMV_EPB", None)
+        else:
+            os.environ["RANS_GEMV_EPB"] = old_epb
+        if old_tile is None:
+            os.environ.pop("RANS_GEMV_TILE", None)
+        else:
+            os.environ["RANS_GEMV_TILE"] = old_tile
     return ms, comp_ratio
 
 
-def main() -> None:
+def run_default(shapes: list[tuple[int, int]]) -> None:
     # Shapes representative of Qwen3-style attention projections at decode.
     # (M, K): M = output dim, K = input dim. GEMV reads M*K FP8 weight bytes.
-    shapes = [
-        ( 2048,  2048),
-        ( 4096,  4096),
-        ( 5120,  5120),   # Qwen3 14B hidden
-        ( 8192,  5120),
-        ( 5120,  8192),
-    ]
-
     print(f"{'M':>6s} {'K':>6s} {'W_MiB':>7s}  "
           f"{'raw_ms':>8s} {'raw_GB/s':>9s}  "
           f"{'fused_ms':>9s} {'fused_GB/s':>11s}  "
@@ -106,6 +116,50 @@ def main() -> None:
               f"{raw_ms:>7.3f} {raw_bw:>8.1f}   "
               f"{fused_ms:>8.3f} {fused_bw:>10.1f}   "
               f"{ratio:>5.3f}x {comp_ratio:>4.2f}x")
+
+
+def run_variants(M: int, K: int) -> None:
+    raw_ms = bench_raw(M, K)
+    raw_bytes = M * K
+    print(f"\nVariant sweep for M={M}, K={K} (raw {raw_ms:.3f} ms)")
+    print(f"{'EPB':>3s} {'tile':>4s} {'fused_ms':>9s} {'fused_GB/s':>11s} "
+          f"{'raw/fused':>9s} {'comp':>5s}")
+    print("-" * 54)
+    for tile in (8, 16, 32):
+        n_pairs_per_segment = K // SEG_PER_ROW // 2
+        if n_pairs_per_segment % tile != 0:
+            print(f"{'-':>3s} {tile:>4d} {'skip':>8s} "
+                  f"{'n_pairs%tile':>10s} {'':>9s} {'':>5s}")
+            continue
+        for epb in (1, 2, 4, 8):
+            fused_ms, comp_ratio = bench_fused(M, K, epb=epb, tile=tile)
+            fused_bw = raw_bytes / fused_ms / 1e6
+            print(f"{epb:>3d} {tile:>4d} {fused_ms:>8.3f} {fused_bw:>10.1f} "
+                  f"{raw_ms / fused_ms:>8.3f}x {comp_ratio:>4.2f}x")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--variants",
+        action="store_true",
+        help="sweep RANS_GEMV_EPB and RANS_GEMV_TILE on one representative shape",
+    )
+    parser.add_argument("--variant-m", type=int, default=5120)
+    parser.add_argument("--variant-k", type=int, default=5120)
+    args = parser.parse_args()
+
+    shapes = [
+        ( 2048,  2048),
+        ( 4096,  4096),
+        ( 5120,  5120),   # Qwen3 14B hidden
+        ( 8192,  5120),
+        ( 5120,  8192),
+    ]
+
+    run_default(shapes)
+    if args.variants:
+        run_variants(args.variant_m, args.variant_k)
 
 
 if __name__ == "__main__":
