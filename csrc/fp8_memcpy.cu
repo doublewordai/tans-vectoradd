@@ -63,6 +63,7 @@ torch::Tensor fp8_vecadd_fused(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, int64_t, int64_t);
 torch::Tensor fp8_gemv_raw(torch::Tensor, torch::Tensor);
+torch::Tensor fp8_gemv_raw_batch(torch::Tensor, torch::Tensor);
 torch::Tensor fp8_gemv_fused(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, int64_t);
@@ -82,6 +83,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused decompress + FP8 vector add from compressed A and B.");
     m.def("fp8_gemv_raw", &fp8_gemv_raw,
           "Uncompressed FP8 GEMV baseline: y = W @ x.");
+    m.def("fp8_gemv_raw_batch", &fp8_gemv_raw_batch,
+          "Uncompressed FP8 batched GEMV baseline: Y = W @ X.");
     m.def("fp8_gemv_fused", &fp8_gemv_fused,
           "Fused decompress + FP8 GEMV from compressed W.");
 }

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from rans_vectoradd import QWEN3_14B_FP8_EXP, encode, quantize_freqs
-from rans_vectoradd._C import fp8_gemv_fused, fp8_gemv_raw
+from rans_vectoradd._C import fp8_gemv_fused, fp8_gemv_raw, fp8_gemv_raw_batch
 
 
 def build_sfc(pair_freqs: torch.Tensor) -> torch.Tensor:
@@ -90,7 +90,10 @@ def test_fused_batch_gemv_matches_raw_gemv() -> None:
 
     W_cuda = W.cuda()
     for B in (2, 4, 8):
-        raw = torch.stack([fp8_gemv_raw(W_cuda, x[b]) for b in range(B)])
+        raw = fp8_gemv_raw_batch(W_cuda, x[:B].contiguous())
+        raw_loop = torch.stack([fp8_gemv_raw(W_cuda, x[b]) for b in range(B)])
+        torch.cuda.synchronize()
+        assert torch.equal(raw, raw_loop), B
         fused = fp8_gemv_fused(
             comp.cuda(),
             offsets.cuda(),

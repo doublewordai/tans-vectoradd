@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import triton.testing
 
-from rans_vectoradd._C import fp8_gemv_raw, fp8_gemv_fused
+from rans_vectoradd._C import fp8_gemv_raw, fp8_gemv_raw_batch, fp8_gemv_fused
 from rans_vectoradd import (
     QWEN3_14B_FP8_EXP,
     encode,
@@ -38,6 +38,26 @@ def bench_raw(M: int, K: int) -> float:
     x = torch.randn(K, dtype=torch.half, device="cuda")
     def _run():
         fp8_gemv_raw(W, x)
+    for _ in range(5):
+        _run()
+    torch.cuda.synchronize()
+    return triton.testing.do_bench(_run, warmup=50, rep=200)
+
+
+def bench_raw_batch(M: int, K: int, B: int, *, check: bool = False) -> float:
+    W = torch.randint(0, 256, (M, K), dtype=torch.uint8, device="cuda")
+    x = torch.randn(B, K, dtype=torch.half, device="cuda")
+
+    def _run():
+        return fp8_gemv_raw_batch(W, x)
+
+    if check:
+        ref = torch.stack([fp8_gemv_raw(W, x[b]) for b in range(B)])
+        got = _run()
+        torch.cuda.synchronize()
+        if not fp16_equal_with_nan(got, ref):
+            max_abs = (got.float() - ref.float()).abs().nan_to_num().max().item()
+            raise AssertionError(f"raw batched mismatch B={B}, max_abs={max_abs}")
     for _ in range(5):
         _run()
     torch.cuda.synchronize()
@@ -243,22 +263,28 @@ def run_batch_variants(M: int, K: int) -> None:
     raw_ms = bench_raw(M, K)
     fused_b1_ms, comp_ratio = bench_fused(M, K)
     raw_bytes = M * K
-    print(f"\nSmall-batch fused sweep for M={M}, K={K}")
+    print(f"\nSmall-batch fair sweep for M={M}, K={K}")
     print(f"B=1 raw current: {raw_ms:.3f} ms, {raw_bytes / raw_ms / 1e6:.1f} GB/s")
     print(f"B=1 fused current: {fused_b1_ms:.3f} ms, {raw_bytes / fused_b1_ms / 1e6:.1f} GB/s, comp {comp_ratio:.2f}x")
-    print(f"{'B':>2s} {'EPB':>3s} {'tile':>4s} {'ms':>8s} {'ms/vec':>8s} "
-          f"{'eff_GB/s':>9s} {'vs_b1':>7s} {'comp':>5s}")
-    print("-" * 62)
+    print(f"{'B':>2s} {'raw_ms':>8s} {'raw/vec':>8s} {'EPB':>3s} {'tile':>4s} "
+          f"{'fused_ms':>9s} {'fused/vec':>10s} {'fused/raw':>9s} {'comp':>5s}")
+    print("-" * 83)
     for B in (2, 4, 8):
+        raw_b_ms = bench_raw_batch(M, K, B, check=True)
+        best: tuple[float, int, int, float] | None = None
         for tile in (8, 16, 32):
             n_pairs_per_segment = K // SEG_PER_ROW // 2
             if n_pairs_per_segment % tile != 0:
                 continue
             for epb in (1, 2, 4, 8):
                 ms, comp_ratio = bench_fused_batch(M, K, B, epb=epb, tile=tile, check=True)
-                eff_bw = (B * raw_bytes) / ms / 1e6
-                print(f"{B:>2d} {epb:>3d} {tile:>4d} {ms:>8.3f} {ms / B:>8.3f} "
-                      f"{eff_bw:>9.1f} {fused_b1_ms / ms * B:>6.3f}x {comp_ratio:>4.2f}x")
+                if best is None or ms < best[0]:
+                    best = (ms, epb, tile, comp_ratio)
+        assert best is not None
+        ms, epb, tile, comp_ratio = best
+        print(f"{B:>2d} {raw_b_ms:>8.3f} {raw_b_ms / B:>8.3f} "
+              f"{epb:>3d} {tile:>4d} {ms:>9.3f} {ms / B:>10.3f} "
+              f"{raw_b_ms / ms:>8.3f}x {comp_ratio:>4.2f}x")
 
 
 def main() -> None:
