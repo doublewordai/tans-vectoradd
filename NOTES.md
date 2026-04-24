@@ -18,6 +18,16 @@ equivalent operation. `python bench_vecadd.py` reproduces.
 
 ## Open questions
 
+### What's the deal with N & the current evidence of bandwidth amplification
+
+Currently, we can get 1.08x bandwidth amplification with N=128. The theoretical
+ceiling, if we treat the memcpy variant as the hardware limit, is like 1.06 or
+something? Probably, we've optimized the DRAM accesses in the fused vecadd
+kernel as well as leveraged the fact that there's less data to transfer. 
+
+We should break this out, and also, get it working more efficiently at larger
+$N$, where the ceiling is higher.
+
 ### Does this work on Blackwell?
 
 4090 is memory-bound; B200 has 8x the HBM bandwidth but similar per-SM
