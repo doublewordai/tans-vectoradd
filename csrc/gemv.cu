@@ -175,7 +175,6 @@ __global__ void fp8_gemv_raw_batch_kernel(
     for (int i = 0; i < n_u4_lane; i++) {
         int u4_idx = i * 32 + lane;
         uint4 w_vec = W_row[u4_idx];
-        int k_base = u4_idx * 16;
         #pragma unroll
         for (int w_off = 0; w_off < 4; w_off++) {
             uint32_t word = (&w_vec.x)[w_off];
@@ -184,15 +183,89 @@ __global__ void fp8_gemv_raw_batch_kernel(
                 __nv_fp8x2_e4m3 w_pair;
                 w_pair.__x = (__nv_fp8x2_storage_t)((word >> (p * 16)) & 0xFFFF);
                 float2 wf = static_cast<float2>(w_pair);
-                int k = k_base + w_off * 4 + p * 2;
+                int k_local = lane * 16 + w_off * 4 + p * 2;
                 #pragma unroll
                 for (int b = 0; b < B; b++) {
                     const __half* xb = x + (int64_t)b * K;
+                    int k = i * 32 * 16 + k_local;
                     acc[b] += wf.x * __half2float(__ldg(xb + k));
                     acc[b] += wf.y * __half2float(__ldg(xb + k + 1));
                 }
             }
         }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int b = 0; b < B; b++) {
+            acc[b] += __shfl_xor_sync(0xFFFFFFFF, acc[b], offset);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int b = 0; b < B; b++) {
+            y[(int64_t)b * M + m] = __float2half(acc[b]);
+        }
+    }
+}
+
+template <int B>
+__global__ void fp8_gemv_raw_batch_staged_kernel(
+    const uint4*   __restrict__ W,    // [M, K/16] uint4 view of [M, K] FP8
+    const __half*  __restrict__ x,    // [B, K]
+    __half*        __restrict__ y,    // [B, M]
+    int M, int K)
+{
+    int warps_per_block = blockDim.x / 32;
+    int warp_in_block   = threadIdx.x / 32;
+    int lane            = threadIdx.x & 31;
+    int m = (int)blockIdx.x * warps_per_block + warp_in_block;
+    if (m >= M) return;
+
+    int n_u4      = K / 16;
+    int n_u4_lane = n_u4 / 32;
+    constexpr int X_TILE = 32 * 16;
+    extern __shared__ uint8_t smem_raw[];
+    __half* x_smem = reinterpret_cast<__half*>(smem_raw);
+
+    float acc[B];
+    #pragma unroll
+    for (int b = 0; b < B; b++) {
+        acc[b] = 0.0f;
+    }
+
+    const uint4* W_row = W + (int64_t)m * n_u4;
+    #pragma unroll 1
+    for (int i = 0; i < n_u4_lane; i++) {
+        for (int j = threadIdx.x; j < B * X_TILE; j += blockDim.x) {
+            int b = j / X_TILE;
+            int k_local = j - b * X_TILE;
+            x_smem[j] = x[(int64_t)b * K + i * X_TILE + k_local];
+        }
+        __syncthreads();
+
+        int u4_idx = i * 32 + lane;
+        uint4 w_vec = W_row[u4_idx];
+        #pragma unroll
+        for (int w_off = 0; w_off < 4; w_off++) {
+            uint32_t word = (&w_vec.x)[w_off];
+            #pragma unroll
+            for (int p = 0; p < 2; p++) {
+                __nv_fp8x2_e4m3 w_pair;
+                w_pair.__x = (__nv_fp8x2_storage_t)((word >> (p * 16)) & 0xFFFF);
+                float2 wf = static_cast<float2>(w_pair);
+                int k_local = lane * 16 + w_off * 4 + p * 2;
+                #pragma unroll
+                for (int b = 0; b < B; b++) {
+                    const __half* xb = x_smem + b * X_TILE;
+                    acc[b] += wf.x * __half2float(xb[k_local]);
+                    acc[b] += wf.y * __half2float(xb[k_local + 1]);
+                }
+            }
+        }
+        __syncthreads();
     }
 
     #pragma unroll
@@ -229,6 +302,8 @@ torch::Tensor fp8_gemv_raw_batch(torch::Tensor W, torch::Tensor x) {
     int warps_per_block = threads / 32;
     int blocks = (M + warps_per_block - 1) / warps_per_block;
 
+    size_t smem = (size_t)B * 32 * 16 * sizeof(__half);
+
 #define LAUNCH_RAW_BATCH(B_VALUE) do {                                                \
     fp8_gemv_raw_batch_kernel<B_VALUE><<<blocks, threads>>>(                          \
         reinterpret_cast<const uint4*>(W.data_ptr<uint8_t>()),                        \
@@ -237,11 +312,20 @@ torch::Tensor fp8_gemv_raw_batch(torch::Tensor W, torch::Tensor x) {
         M, K);                                                                        \
 } while (0)
 
+#define LAUNCH_RAW_BATCH_STAGED(B_VALUE) do {                                         \
+    fp8_gemv_raw_batch_staged_kernel<B_VALUE><<<blocks, threads, smem>>>(             \
+        reinterpret_cast<const uint4*>(W.data_ptr<uint8_t>()),                        \
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                      \
+        reinterpret_cast<__half*>(y.data_ptr<at::Half>()),                            \
+        M, K);                                                                        \
+} while (0)
+
     if      (B == 2) { LAUNCH_RAW_BATCH(2); }
     else if (B == 4) { LAUNCH_RAW_BATCH(4); }
-    else             { LAUNCH_RAW_BATCH(8); }
+    else             { LAUNCH_RAW_BATCH_STAGED(8); }
 
 #undef LAUNCH_RAW_BATCH
+#undef LAUNCH_RAW_BATCH_STAGED
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
