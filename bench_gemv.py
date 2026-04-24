@@ -64,6 +64,26 @@ def bench_raw_batch(M: int, K: int, B: int, *, check: bool = False) -> float:
     return triton.testing.do_bench(_run, warmup=50, rep=200)
 
 
+def bench_torch_fp8_mm(M: int, K: int, B: int) -> float:
+    if B % 16 != 0:
+        raise ValueError("torch._scaled_mm FP8 baseline requires B divisible by 16")
+    W_u8 = torch.randint(0, 256, (M, K), dtype=torch.uint8, device="cuda")
+    W = W_u8.view(torch.float8_e4m3fn)
+    X_h = torch.randn(K, B, dtype=torch.float16, device="cuda")
+    # cuBLASLt FP8 path expects mat2 with stride(0) == 1.
+    X = torch.empty_strided((K, B), (1, K), dtype=torch.float8_e4m3fn, device="cuda")
+    X.copy_(X_h.to(torch.float8_e4m3fn))
+    scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+
+    def _run():
+        torch._scaled_mm(W, X, scale_a=scale, scale_b=scale, out_dtype=torch.float16)
+
+    for _ in range(10):
+        _run()
+    torch.cuda.synchronize()
+    return triton.testing.do_bench(_run, warmup=50, rep=200)
+
+
 def fp16_equal_with_nan(a: torch.Tensor, b: torch.Tensor) -> bool:
     return bool(torch.equal(a, b) or torch.equal(torch.nan_to_num(a), torch.nan_to_num(b)))
 
@@ -287,6 +307,18 @@ def run_batch_variants(M: int, K: int) -> None:
               f"{raw_b_ms / ms:>8.3f}x {comp_ratio:>4.2f}x")
 
 
+def run_torch_fp8_mm(shapes: list[tuple[int, int]], batches: list[int]) -> None:
+    print("\nPyTorch torch._scaled_mm FP8xFP8 baseline")
+    print("Note: this uses FP8 activations and requires B divisible by 16.")
+    print(f"{'M':>6s} {'K':>6s} {'B':>4s} {'ms':>8s} {'ms/vec':>8s} {'eff_GB/s':>10s}")
+    print("-" * 52)
+    for M, K in shapes:
+        for B in batches:
+            ms = bench_torch_fp8_mm(M, K, B)
+            eff_bw = (M * K * B) / ms / 1e6
+            print(f"{M:>6d} {K:>6d} {B:>4d} {ms:>8.4f} {ms / B:>8.5f} {eff_bw:>10.1f}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -303,6 +335,16 @@ def main() -> None:
         "--batch-variants",
         action="store_true",
         help="sweep fused small-batch GEMV variants for B=2/4/8",
+    )
+    parser.add_argument(
+        "--torch-fp8-mm",
+        action="store_true",
+        help="benchmark PyTorch/cuBLASLt torch._scaled_mm FP8xFP8 baseline",
+    )
+    parser.add_argument(
+        "--torch-fp8-batches",
+        default="16,32,64",
+        help="comma-separated B values for --torch-fp8-mm; each must be divisible by 16",
     )
     parser.add_argument("--variant-m", type=int, default=5120)
     parser.add_argument("--variant-k", type=int, default=5120)
@@ -322,6 +364,9 @@ def main() -> None:
         run_variants(args.variant_m, args.variant_k)
     if args.batch_variants:
         run_batch_variants(args.variant_m, args.variant_k)
+    if args.torch_fp8_mm:
+        batches = [int(x) for x in args.torch_fp8_batches.split(",") if x]
+        run_torch_fp8_mm(shapes, batches)
 
 
 if __name__ == "__main__":
