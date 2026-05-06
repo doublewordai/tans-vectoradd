@@ -81,9 +81,8 @@ struct TansCtx {
     uint32_t x;
     uint32_t buf_hi;       // Current slab; MSB end is consumed next.
     uint32_t buf_lo;       // Reserve slab promoted to buf_hi on advance.
-    uint32_t buf_xtra;     // Extra reserve slab used to hide refill latency.
     uint32_t cnt;          // Bits already consumed from buf_hi, in [0, 31].
-    int slab_idx;          // Next slab to load into buf_xtra, or -1.
+    int slab_idx;          // Next slab to load into buf_lo on advance, or -1.
     int32_t block_base_u32;
 };
 
@@ -112,10 +111,7 @@ __device__ __forceinline__ void init_tans_ctx(
     ctx.buf_lo = next_top >= 0
         ? __ldg(&compressed[ctx.block_base_u32 + next_top * kBlockStreams + tid])
         : 0u;
-    ctx.buf_xtra = extra_top >= 0
-        ? __ldg(&compressed[ctx.block_base_u32 + extra_top * kBlockStreams + tid])
-        : 0u;
-    ctx.slab_idx = extra_top - 1;
+    ctx.slab_idx = extra_top;
 
     uint32_t partial = partial_cnts[sid];
     ctx.cnt = partial == 0u ? 0u : 32u - partial;
@@ -155,8 +151,7 @@ __device__ __forceinline__ uint8_t tans_step(
     }
 
     ctx.buf_hi = advance ? ctx.buf_lo : ctx.buf_hi;
-    ctx.buf_lo = advance ? ctx.buf_xtra : ctx.buf_lo;
-    ctx.buf_xtra = advance ? new_xtra : ctx.buf_xtra;
+    ctx.buf_lo = advance ? new_xtra : ctx.buf_lo;
     ctx.cnt = advance ? cnt_new - 32u : cnt_new;
     ctx.slab_idx = advance ? ctx.slab_idx - 1 : ctx.slab_idx;
 
