@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <cstring>
 #include <stdint.h>
 
@@ -20,7 +21,7 @@ namespace {
 
 constexpr int kTansL = 4096;
 constexpr int kBlockStreams = 128;
-constexpr int kStreamsPerBlock = 4;
+constexpr int kDefaultStreamsPerBlock = 8;
 constexpr int kTilePairs = 8;
 
 __device__ __forceinline__ uint8_t add_fp8_bytes(uint8_t a, uint8_t b) {
@@ -154,6 +155,7 @@ __device__ __forceinline__ uint8_t tans_step(
     return sym;
 }
 
+template <int kStreamsPerBlock>
 __global__ void fp8_vecadd_fused_tans_kernel(
     const uint32_t* __restrict__ a_compressed,
     const int32_t*  __restrict__ a_offsets,
@@ -242,6 +244,21 @@ __global__ void fp8_vecadd_fused_tans_kernel(
     }
 }
 
+int streams_per_block_from_env() {
+    const char* value = std::getenv("TANS_STREAMS_PER_BLOCK");
+    if (value == nullptr || value[0] == '\0') {
+        return kDefaultStreamsPerBlock;
+    }
+
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    TORCH_CHECK(end != value && *end == '\0',
+                "TANS_STREAMS_PER_BLOCK must be an integer");
+    TORCH_CHECK(parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8,
+                "TANS_STREAMS_PER_BLOCK must be one of 1, 2, 4, or 8");
+    return static_cast<int>(parsed);
+}
+
 void check_u8_cuda_contiguous(const char* name, const torch::Tensor& t) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
     TORCH_CHECK(t.dtype() == torch::kUInt8, name, " must be uint8");
@@ -325,29 +342,52 @@ torch::Tensor fp8_vecadd_fused_tans(
         {n_tiles * n_streams * kTilePairs * 2},
         torch::TensorOptions().dtype(torch::kUInt8).device(a_comp.device()));
 
-    C10_CUDA_CHECK(cudaFuncSetCacheConfig(
-        fp8_vecadd_fused_tans_kernel,
-        cudaFuncCachePreferL1));
+    int streams_per_block = streams_per_block_from_env();
 
-    int64_t blocks = (n_enc_blocks + kStreamsPerBlock - 1) / kStreamsPerBlock;
-    int threads = kBlockStreams * kStreamsPerBlock;
-    int smem_bytes = kTansL * 4 + 2 * kTilePairs * threads;
+#define LAUNCH_FUSED_TANS(SPB)                                                \
+    do {                                                                       \
+        C10_CUDA_CHECK(cudaFuncSetCacheConfig(                                 \
+            fp8_vecadd_fused_tans_kernel<SPB>,                                 \
+            cudaFuncCachePreferL1));                                           \
+        int64_t blocks = (n_enc_blocks + (SPB) - 1) / (SPB);                   \
+        int threads = kBlockStreams * (SPB);                                   \
+        int smem_bytes = kTansL * 4 + 2 * kTilePairs * threads;                \
+        fp8_vecadd_fused_tans_kernel<SPB><<<blocks, threads, smem_bytes>>>(    \
+            reinterpret_cast<const uint32_t*>(a_comp.data_ptr<uint8_t>()),     \
+            a_offsets.data_ptr<int32_t>(),                                     \
+            a_states.data_ptr<uint16_t>(),                                     \
+            a_partial.data_ptr<uint8_t>(),                                     \
+            a_sm.data_ptr<uint8_t>(),                                          \
+            reinterpret_cast<const uint32_t*>(b_comp.data_ptr<uint8_t>()),     \
+            b_offsets.data_ptr<int32_t>(),                                     \
+            b_states.data_ptr<uint16_t>(),                                     \
+            b_partial.data_ptr<uint8_t>(),                                     \
+            b_sm.data_ptr<uint8_t>(),                                          \
+            reinterpret_cast<const uint32_t*>(decode_tbl.data_ptr<int32_t>()), \
+            output.data_ptr<uint8_t>(),                                        \
+            n_fp8_per_stream,                                                  \
+            n_streams);                                                        \
+    } while (0)
 
-    fp8_vecadd_fused_tans_kernel<<<blocks, threads, smem_bytes>>>(
-        reinterpret_cast<const uint32_t*>(a_comp.data_ptr<uint8_t>()),
-        a_offsets.data_ptr<int32_t>(),
-        a_states.data_ptr<uint16_t>(),
-        a_partial.data_ptr<uint8_t>(),
-        a_sm.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(b_comp.data_ptr<uint8_t>()),
-        b_offsets.data_ptr<int32_t>(),
-        b_states.data_ptr<uint16_t>(),
-        b_partial.data_ptr<uint8_t>(),
-        b_sm.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(decode_tbl.data_ptr<int32_t>()),
-        output.data_ptr<uint8_t>(),
-        n_fp8_per_stream,
-        n_streams);
+    switch (streams_per_block) {
+        case 1:
+            LAUNCH_FUSED_TANS(1);
+            break;
+        case 2:
+            LAUNCH_FUSED_TANS(2);
+            break;
+        case 4:
+            LAUNCH_FUSED_TANS(4);
+            break;
+        case 8:
+            LAUNCH_FUSED_TANS(8);
+            break;
+        default:
+            TORCH_CHECK(false, "unreachable TANS_STREAMS_PER_BLOCK value");
+    }
+
+#undef LAUNCH_FUSED_TANS
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
