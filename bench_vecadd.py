@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Iterator
 
 import torch
 import triton.testing
@@ -17,6 +18,9 @@ from rans_vectoradd import (
 )
 
 TILE_PAIRS = 8
+DEFAULT_CACHE_CONFIGS = ["prefer_equal"]
+DEFAULT_SHARED_CARVEOUTS = ["default"]
+DEFAULT_PREFETCH = ["off"]
 
 
 def bench(fn) -> float:
@@ -78,8 +82,17 @@ def bench_fused(
     hbm_bytes: int,
     bits_per_fp8: float,
     streams_per_block: int,
+    cache_config: str,
+    shared_carveout: str,
+    prefetch: str,
 ) -> dict[str, float]:
     os.environ["TANS_STREAMS_PER_BLOCK"] = str(streams_per_block)
+    os.environ["TANS_CACHE_CONFIG"] = cache_config
+    os.environ["TANS_REGISTER_PREFETCH"] = prefetch
+    if shared_carveout == "unset":
+        os.environ.pop("TANS_SHARED_CARVEOUT", None)
+    else:
+        os.environ["TANS_SHARED_CARVEOUT"] = shared_carveout
     ms = bench(lambda: fn(*kernel_args, n_fp8_per_stream))
     seconds = ms / 1000.0
 
@@ -88,6 +101,14 @@ def bench_fused(
         "gb_s": hbm_bytes / 1e9 / seconds,
         "bits_per_fp8": bits_per_fp8,
     }
+
+
+def iter_modes(args: argparse.Namespace) -> Iterator[tuple[int, str, str, str]]:
+    for streams_per_block in args.streams_per_block:
+        for cache_config in args.cache_config:
+            for shared_carveout in args.shared_carveout:
+                for prefetch in args.prefetch:
+                    yield streams_per_block, cache_config, shared_carveout, prefetch
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +135,30 @@ def parse_args() -> argparse.Namespace:
         default="both",
         help="Fused kernel staging variant to benchmark.",
     )
+    parser.add_argument(
+        "--cache-config",
+        nargs="+",
+        default=DEFAULT_CACHE_CONFIGS,
+        help=(
+            "Register-kernel cudaFuncSetCacheConfig mode: prefer_l1, "
+            "prefer_shared, prefer_equal, or prefer_none."
+        ),
+    )
+    parser.add_argument(
+        "--shared-carveout",
+        nargs="+",
+        default=DEFAULT_SHARED_CARVEOUTS,
+        help=(
+            "Register-kernel TANS_SHARED_CARVEOUT values: unset, default, "
+            "max_shared, max_l1, equal, or integer percentage."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch",
+        nargs="+",
+        default=DEFAULT_PREFETCH,
+        help="Register-kernel prefetch mode: on or off.",
+    )
     return parser.parse_args()
 
 
@@ -135,18 +180,37 @@ def main() -> None:
             variants.append(("register", fp8_vecadd_fused_tans_register))
 
         for variant_name, fn in variants:
-            for streams_per_block in args.streams_per_block:
-                fused = bench_fused(
-                    fn,
-                    kernel_args,
-                    n_fp8_per_stream,
-                    hbm_bytes,
-                    bits_per_fp8,
-                    streams_per_block,
-                )
+            for streams_per_block, cache_config, shared_carveout, prefetch in iter_modes(args):
+                try:
+                    fused = bench_fused(
+                        fn,
+                        kernel_args,
+                        n_fp8_per_stream,
+                        hbm_bytes,
+                        bits_per_fp8,
+                        streams_per_block,
+                        cache_config,
+                        shared_carveout,
+                        prefetch,
+                    )
+                except Exception as exc:
+                    print(
+                        f"{variant_name:<8}  "
+                        f"spb={streams_per_block:<2}  "
+                        f"cache={cache_config:<13}  "
+                        f"carveout={shared_carveout:<10}  "
+                        f"prefetch={prefetch:<3}  "
+                        f"N={n_fp8_per_stream:>5}  "
+                        f"FAIL  {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    continue
                 print(
                     f"{variant_name:<8}  "
                     f"spb={streams_per_block:<2}  "
+                    f"cache={cache_config:<13}  "
+                    f"carveout={shared_carveout:<10}  "
+                    f"prefetch={prefetch:<3}  "
                     f"N={n_fp8_per_stream:>5}  "
                     f"{fused['ms']:.3f} ms  "
                     f"{raw['ms'] / fused['ms']:.3f}x raw  "

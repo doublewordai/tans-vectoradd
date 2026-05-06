@@ -25,6 +25,9 @@ constexpr int kTansL = 4096;
 constexpr int kBlockStreams = 128;
 constexpr int kDefaultStreamsPerBlock = 8;
 constexpr int kTilePairs = 8;
+constexpr const char* kDefaultCacheConfig = "prefer_equal";
+constexpr const char* kDefaultSharedCarveout = "default";
+constexpr bool kDefaultRegisterPrefetch = false;
 
 __device__ __forceinline__ uint8_t add_fp8_bytes(uint8_t a, uint8_t b) {
     __nv_fp8_e4m3 fa, fb;
@@ -118,6 +121,7 @@ __device__ __forceinline__ void init_tans_ctx(
     ctx.cnt = partial == 0u ? 0u : 32u - partial;
 }
 
+template <bool kPrefetch>
 __device__ __forceinline__ uint8_t tans_step(
     TansCtx& ctx,
     const uint32_t* __restrict__ compressed,
@@ -141,11 +145,13 @@ __device__ __forceinline__ uint8_t tans_step(
             ctx.block_base_u32 + ctx.slab_idx * kBlockStreams + tid]);
     }
 
-    int prefetch_idx = ctx.slab_idx - 1;
-    if (prefetch_idx >= 0) {
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(
-            &compressed[ctx.block_base_u32
-                + prefetch_idx * kBlockStreams + tid]));
+    if constexpr (kPrefetch) {
+        int prefetch_idx = ctx.slab_idx - 1;
+        if (prefetch_idx >= 0) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(
+                &compressed[ctx.block_base_u32
+                    + prefetch_idx * kBlockStreams + tid]));
+        }
     }
 
     ctx.buf_hi = advance ? ctx.buf_lo : ctx.buf_hi;
@@ -212,9 +218,9 @@ __global__ void fp8_vecadd_fused_tans_kernel(
             #pragma unroll
             for (int t = 0; t < kTilePairs; t++) {
                 decoded_sym_a[t * blockDim.x + threadIdx.x] =
-                    tans_step(ctx_a, a_compressed, tid, tbl_smem);
+                    tans_step<true>(ctx_a, a_compressed, tid, tbl_smem);
                 decoded_sym_b[t * blockDim.x + threadIdx.x] =
-                    tans_step(ctx_b, b_compressed, tid, tbl_smem);
+                    tans_step<true>(ctx_b, b_compressed, tid, tbl_smem);
             }
         }
         __syncthreads();
@@ -246,7 +252,7 @@ __global__ void fp8_vecadd_fused_tans_kernel(
     }
 }
 
-template <int kStreamsPerBlock>
+template <int kStreamsPerBlock, bool kPrefetch>
 __global__ void fp8_vecadd_fused_tans_register_kernel(
     const uint32_t* __restrict__ a_compressed,
     const int32_t*  __restrict__ a_offsets,
@@ -300,8 +306,10 @@ __global__ void fp8_vecadd_fused_tans_register_kernel(
 
             #pragma unroll
             for (int t = 0; t < kTilePairs; t++) {
-                sym_a[t] = tans_step(ctx_a, a_compressed, tid, tbl_smem);
-                sym_b[t] = tans_step(ctx_b, b_compressed, tid, tbl_smem);
+                sym_a[t] = tans_step<kPrefetch>(
+                    ctx_a, a_compressed, tid, tbl_smem);
+                sym_b[t] = tans_step<kPrefetch>(
+                    ctx_b, b_compressed, tid, tbl_smem);
             }
 
             uint8_t out_buf[kTilePairs * 2];
@@ -366,6 +374,114 @@ int streams_per_block_from_env() {
     TORCH_CHECK(parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8,
                 "TANS_STREAMS_PER_BLOCK must be one of 1, 2, 4, or 8");
     return static_cast<int>(parsed);
+}
+
+cudaFuncCache cache_config_from_env() {
+    const char* value = std::getenv("TANS_CACHE_CONFIG");
+    if (value == nullptr || value[0] == '\0') {
+        value = kDefaultCacheConfig;
+    }
+
+    if (std::strcmp(value, "prefer_l1") == 0
+        || std::strcmp(value, "l1") == 0) {
+        return cudaFuncCachePreferL1;
+    }
+    if (std::strcmp(value, "prefer_shared") == 0
+        || std::strcmp(value, "shared") == 0) {
+        return cudaFuncCachePreferShared;
+    }
+    if (std::strcmp(value, "prefer_equal") == 0
+        || std::strcmp(value, "equal") == 0) {
+        return cudaFuncCachePreferEqual;
+    }
+    if (std::strcmp(value, "prefer_none") == 0
+        || std::strcmp(value, "none") == 0) {
+        return cudaFuncCachePreferNone;
+    }
+
+    TORCH_CHECK(false,
+                "TANS_CACHE_CONFIG must be one of prefer_l1, prefer_shared, "
+                "prefer_equal, or prefer_none");
+    return cudaFuncCachePreferL1;
+}
+
+bool shared_carveout_from_env(int* carveout) {
+    const char* value = std::getenv("TANS_SHARED_CARVEOUT");
+    if (value == nullptr || value[0] == '\0') {
+        value = kDefaultSharedCarveout;
+    }
+
+    if (std::strcmp(value, "unset") == 0
+        || std::strcmp(value, "none") == 0) {
+        return false;
+    }
+
+    if (std::strcmp(value, "default") == 0) {
+        *carveout = -1;
+        return true;
+    }
+    if (std::strcmp(value, "max_shared") == 0
+        || std::strcmp(value, "shared") == 0) {
+        *carveout = 100;
+        return true;
+    }
+    if (std::strcmp(value, "max_l1") == 0
+        || std::strcmp(value, "l1") == 0) {
+        *carveout = 0;
+        return true;
+    }
+    if (std::strcmp(value, "equal") == 0) {
+        *carveout = 50;
+        return true;
+    }
+
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    TORCH_CHECK(end != value && *end == '\0',
+                "TANS_SHARED_CARVEOUT must be unset, default, max_shared, "
+                "max_l1, equal, or an integer percentage");
+    TORCH_CHECK(parsed >= -1 && parsed <= 100,
+                "TANS_SHARED_CARVEOUT integer must be in [-1, 100]");
+    *carveout = static_cast<int>(parsed);
+    return true;
+}
+
+bool register_prefetch_from_env() {
+    const char* value = std::getenv("TANS_REGISTER_PREFETCH");
+    if (value == nullptr || value[0] == '\0') {
+        return kDefaultRegisterPrefetch;
+    }
+
+    if (std::strcmp(value, "on") == 0
+        || std::strcmp(value, "true") == 0
+        || std::strcmp(value, "1") == 0
+        || std::strcmp(value, "yes") == 0) {
+        return true;
+    }
+    if (std::strcmp(value, "off") == 0
+        || std::strcmp(value, "false") == 0
+        || std::strcmp(value, "0") == 0
+        || std::strcmp(value, "no") == 0) {
+        return false;
+    }
+
+    TORCH_CHECK(false,
+                "TANS_REGISTER_PREFETCH must be on/true/1/yes or "
+                "off/false/0/no");
+    return true;
+}
+
+template <typename Kernel>
+void set_register_launch_attributes(Kernel kernel) {
+    C10_CUDA_CHECK(cudaFuncSetCacheConfig(kernel, cache_config_from_env()));
+
+    int carveout = 0;
+    if (shared_carveout_from_env(&carveout)) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            carveout));
+    }
 }
 
 void check_u8_cuda_contiguous(const char* name, const torch::Tensor& t) {
@@ -481,27 +597,52 @@ torch::Tensor fp8_vecadd_fused_tans_impl(
                 n_fp8_per_stream,                                              \
                 n_streams);                                                    \
         } else {                                                               \
-            C10_CUDA_CHECK(cudaFuncSetCacheConfig(                             \
-                fp8_vecadd_fused_tans_register_kernel<SPB>,                    \
-                cudaFuncCachePreferL1));                                       \
             int smem_bytes = kTansL * 4;                                       \
-            fp8_vecadd_fused_tans_register_kernel<SPB><<<                      \
-                blocks, threads, smem_bytes>>>(                                \
-                reinterpret_cast<const uint32_t*>(a_comp.data_ptr<uint8_t>()), \
-                a_offsets.data_ptr<int32_t>(),                                 \
-                a_states.data_ptr<uint16_t>(),                                 \
-                a_partial.data_ptr<uint8_t>(),                                 \
-                a_sm.data_ptr<uint8_t>(),                                      \
-                reinterpret_cast<const uint32_t*>(b_comp.data_ptr<uint8_t>()), \
-                b_offsets.data_ptr<int32_t>(),                                 \
-                b_states.data_ptr<uint16_t>(),                                 \
-                b_partial.data_ptr<uint8_t>(),                                 \
-                b_sm.data_ptr<uint8_t>(),                                      \
-                reinterpret_cast<const uint32_t*>(                             \
-                    decode_tbl.data_ptr<int32_t>()),                           \
-                output.data_ptr<uint8_t>(),                                    \
-                n_fp8_per_stream,                                              \
-                n_streams);                                                    \
+            if (register_prefetch_from_env()) {                                \
+                set_register_launch_attributes(                                \
+                    fp8_vecadd_fused_tans_register_kernel<SPB, true>);         \
+                fp8_vecadd_fused_tans_register_kernel<SPB, true><<<            \
+                    blocks, threads, smem_bytes>>>(                            \
+                    reinterpret_cast<const uint32_t*>(                          \
+                        a_comp.data_ptr<uint8_t>()),                           \
+                    a_offsets.data_ptr<int32_t>(),                             \
+                    a_states.data_ptr<uint16_t>(),                             \
+                    a_partial.data_ptr<uint8_t>(),                             \
+                    a_sm.data_ptr<uint8_t>(),                                  \
+                    reinterpret_cast<const uint32_t*>(                          \
+                        b_comp.data_ptr<uint8_t>()),                           \
+                    b_offsets.data_ptr<int32_t>(),                             \
+                    b_states.data_ptr<uint16_t>(),                             \
+                    b_partial.data_ptr<uint8_t>(),                             \
+                    b_sm.data_ptr<uint8_t>(),                                  \
+                    reinterpret_cast<const uint32_t*>(                         \
+                        decode_tbl.data_ptr<int32_t>()),                       \
+                    output.data_ptr<uint8_t>(),                                \
+                    n_fp8_per_stream,                                          \
+                    n_streams);                                                \
+            } else {                                                           \
+                set_register_launch_attributes(                                \
+                    fp8_vecadd_fused_tans_register_kernel<SPB, false>);        \
+                fp8_vecadd_fused_tans_register_kernel<SPB, false><<<           \
+                    blocks, threads, smem_bytes>>>(                            \
+                    reinterpret_cast<const uint32_t*>(                          \
+                        a_comp.data_ptr<uint8_t>()),                           \
+                    a_offsets.data_ptr<int32_t>(),                             \
+                    a_states.data_ptr<uint16_t>(),                             \
+                    a_partial.data_ptr<uint8_t>(),                             \
+                    a_sm.data_ptr<uint8_t>(),                                  \
+                    reinterpret_cast<const uint32_t*>(                          \
+                        b_comp.data_ptr<uint8_t>()),                           \
+                    b_offsets.data_ptr<int32_t>(),                             \
+                    b_states.data_ptr<uint16_t>(),                             \
+                    b_partial.data_ptr<uint8_t>(),                             \
+                    b_sm.data_ptr<uint8_t>(),                                  \
+                    reinterpret_cast<const uint32_t*>(                         \
+                        decode_tbl.data_ptr<int32_t>()),                       \
+                    output.data_ptr<uint8_t>(),                                \
+                    n_fp8_per_stream,                                          \
+                    n_streams);                                                \
+            }                                                                  \
         }                                                                      \
     } while (0)
 

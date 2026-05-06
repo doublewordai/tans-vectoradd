@@ -31,6 +31,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--size-mib", type=int, default=1024)
     parser.add_argument("--streams-per-block", type=int, choices=[1, 2, 4, 8], default=8)
     parser.add_argument("--variant", choices=["shared", "register"], default="register")
+    parser.add_argument(
+        "--cache-config",
+        default="prefer_equal",
+        help="Register-kernel cudaFuncSetCacheConfig mode for fused profiling.",
+    )
+    parser.add_argument(
+        "--shared-carveout",
+        default="default",
+        help="Register-kernel TANS_SHARED_CARVEOUT value for fused profiling.",
+    )
+    parser.add_argument(
+        "--prefetch",
+        choices=["on", "off"],
+        default="off",
+        help="Register-kernel prefetch mode for fused profiling.",
+    )
     return parser.parse_args()
 
 
@@ -52,9 +68,25 @@ def profile_fused(
     n_fp8_per_stream: int,
     streams_per_block: int,
     variant: str,
+    cache_config: str,
+    shared_carveout: str,
+    prefetch: str,
 ) -> None:
     n_streams = n_bytes // n_fp8_per_stream
     os.environ["TANS_STREAMS_PER_BLOCK"] = str(streams_per_block)
+    os.environ["TANS_CACHE_CONFIG"] = cache_config
+    os.environ["TANS_REGISTER_PREFETCH"] = prefetch
+    if shared_carveout == "unset":
+        os.environ.pop("TANS_SHARED_CARVEOUT", None)
+    else:
+        os.environ["TANS_SHARED_CARVEOUT"] = shared_carveout
+    print(
+        "profile fused: "
+        f"variant={variant} size_mib={n_bytes >> 20} N={n_fp8_per_stream} "
+        f"spb={streams_per_block} cache={cache_config} "
+        f"carveout={shared_carveout} prefetch={prefetch}",
+        flush=True,
+    )
 
     exp_freqs = torch.tensor(QWEN3_14B_FP8_EXP, dtype=torch.float64)
     torch.manual_seed(42)
@@ -92,7 +124,15 @@ def main() -> None:
     if args.mode == "raw":
         profile_raw(n_bytes)
     else:
-        profile_fused(n_bytes, args.n, args.streams_per_block, args.variant)
+        profile_fused(
+            n_bytes,
+            args.n,
+            args.streams_per_block,
+            args.variant,
+            args.cache_config,
+            args.shared_carveout,
+            args.prefetch,
+        )
 
 
 if __name__ == "__main__":
