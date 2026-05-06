@@ -1,43 +1,42 @@
-# NOTES
+# tANS FP8 Vector Add
 
-## What this is
+This repo is a small CUDA harness for testing bandwidth amplification from
+lossless FP8 compression.
 
-A fused kernel that decompresses rANS-encoded FP8 weights and does a
-vector add in one pass. The goal is "bandwidth amplification" — a
-kernel that processes compressed weights faster than raw HBM can
-deliver uncompressed bytes, because the compressed input is smaller.
+The active path is:
 
-## Current state
+1. Generate FP8-like bytes with the Qwen3-14B-FP8 exponent distribution.
+2. Split each byte into exponent and sign+mantissa nibbles.
+3. tANS-code exponent pairs on CPU.
+4. Decode the exponent pairs inside a fused CUDA kernel, reconstruct FP8
+   bytes, add two tensors as E4M3, and write the result.
 
-On RTX 4090, the fused kernel's output throughput is 3–8% higher than
-the same vector add run on uncompressed inputs. The uncompressed
-reference already saturates HBM (~904 GB/s, ~91% of DRAM peak), so
-this is genuine bandwidth amplification — the kernel produces
-decompressed FP8 faster than the card can deliver raw FP8 for the
-equivalent operation. `python bench_vecadd.py` reproduces.
+The toy workload is vector add. It is deliberately memory-bound, so beating
+the raw FP8 vector-add baseline is evidence that the fused decompressor is
+recovering more logical FP8 bytes per second than raw HBM can deliver.
 
-## Open questions
+## Files
 
-### What's the deal with N & the current evidence of bandwidth amplification
+- `rans_vectoradd/tans_codec.py` - Python-side tANS table construction and
+  FP8 pair-stream preparation.
+- `csrc/tans_codec.cpp` - CPU tANS encoder into the GPU slab layout.
+- `csrc/tans_decode.cu` - standalone GPU tANS decoder used by the round-trip
+  test.
+- `csrc/vecadd.cu` - raw FP8 vecadd baseline and the fused tANS vecadd kernel.
+- `bench_vecadd.py` - local benchmark.
+- `profile_vecadd.py` - minimal Nsight Compute driver.
 
-Currently, we can get 1.08x bandwidth amplification with N=128. The theoretical
-ceiling, if we treat the memcpy variant as the hardware limit, is like 1.06 or
-something? Probably, we've optimized the DRAM accesses in the fused vecadd
-kernel as well as leveraged the fact that there's less data to transfer. 
+## Current 4090 Baseline
 
-We should break this out, and also, get it working more efficiently at larger
-$N$, where the ceiling is higher.
+On this machine, `CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_vecadd.py`
+previously measured raw FP8 vecadd at roughly 908 GB/s. The fused tANS path
+was faster than raw for the main sweep, peaking at about 1.10x raw around
+`N=1024`.
 
-### Does this work on Blackwell?
+## Commands
 
-4090 is memory-bound; B200 has 8x the HBM bandwidth but similar per-SM
-decode compute. An unmodified port is expected to underperform memcpy
-on B200 by a lot. Open question: what does it take to get bandwidth
-amplification on B200?
-
-### Does fusing into a real workload work?
-
-The vecadd is a toy. The real claim is that we can decompress weights
-inline with a consumer kernel (GEMM, attention) and beat the
-uncompressed version end-to-end. Open question: can we fuse this into
-a competitive FlashAttention kernel and beat uncompressed FA?
+```bash
+just build
+just test
+just bench
+```

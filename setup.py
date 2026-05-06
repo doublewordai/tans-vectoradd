@@ -20,7 +20,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 def cuda_gencode_flags() -> list[str]:
     """Build for requested or visible CUDA architectures."""
-    archs = os.environ.get("RANS_CUDA_ARCHS")
+    archs = os.environ.get("TANS_CUDA_ARCHS")
     if archs:
         sms = [a.strip().removeprefix("sm_").replace(".", "") for a in archs.split(",")]
     elif torch.cuda.is_available():
@@ -43,10 +43,9 @@ setup(
             name="rans_vectoradd._C",
             sources=[
                 "csrc/fp8_memcpy.cu",
-                "csrc/rans_codec.cpp",
-                "csrc/rans_decode.cu",
+                "csrc/tans_codec.cpp",
+                "csrc/tans_decode.cu",
                 "csrc/vecadd.cu",
-                "csrc/gemv.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-fopenmp"],

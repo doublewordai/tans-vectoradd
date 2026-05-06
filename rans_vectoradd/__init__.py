@@ -1,24 +1,16 @@
-import torch  # noqa: F401
-
 from rans_vectoradd._C import (
-    fp8_memcpy_digest,
-    gpu_rans_decode,
-    gpu_rans_decode_dump,
-)
-from rans_vectoradd.codec import (
-    BLOCK_STREAMS,
-    encode,
-    quantize_freqs,
+    fp8_vecadd_fused_tans,
+    fp8_vecadd_raw,
+    gpu_tans_decode,
 )
 from rans_vectoradd.data import QWEN3_14B_FP8_EXP, random_fp8_bytes
+from . import tans_codec
 
 __all__ = [
-    "BLOCK_STREAMS",
     "QWEN3_14B_FP8_EXP",
-    "encode",
-    "fp8_memcpy_digest",
-    "gpu_rans_decode",
-    "gpu_rans_decode_dump",
-    "quantize_freqs",
+    "fp8_vecadd_fused_tans",
+    "fp8_vecadd_raw",
+    "gpu_tans_decode",
     "random_fp8_bytes",
+    "tans_codec",
 ]

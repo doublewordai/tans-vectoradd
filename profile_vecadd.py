@@ -1,58 +1,51 @@
-"""Run fp8_vecadd_fused at one N value for ncu profiling.
+"""Minimal ncu driver for the fused tANS vecadd kernel.
 
-Usage: profile_vecadd.py <N>
+Usage:
+    ncu --target-processes all --kernel-name regex:fp8_vecadd_fused_tans \
+        --launch-skip 5 --launch-count 3 --set detailed \
+        .venv/bin/python profile_vecadd.py 1024
 """
+from __future__ import annotations
+
 import sys
-import numpy as np
+
 import torch
 
-from rans_vectoradd._C import fp8_vecadd_fused
 from rans_vectoradd import (
     QWEN3_14B_FP8_EXP,
-    encode,
-    quantize_freqs,
+    fp8_vecadd_fused_tans,
     random_fp8_bytes,
+    tans_codec,
 )
+
+TILE_PAIRS = 8
 
 
 def main() -> None:
-    N = int(sys.argv[1])
-    n_bytes = 1 << 30  # 1 GiB
-    K = n_bytes // N
+    n_fp8_per_stream = int(sys.argv[1]) if len(sys.argv) > 1 else 1024
+    n_bytes = 1 << 30
+    n_streams = n_bytes // n_fp8_per_stream
 
-    exp_freqs = quantize_freqs(np.array(QWEN3_14B_FP8_EXP, dtype=np.float64))
+    exp_freqs = torch.tensor(QWEN3_14B_FP8_EXP, dtype=torch.float64)
     torch.manual_seed(42)
-    fp8_a = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
-    fp8_b = random_fp8_bytes(K * N, device="cpu").reshape(K, N)
+    fp8_a = random_fp8_bytes(n_streams * n_fp8_per_stream, device="cpu")
+    fp8_b = random_fp8_bytes(n_streams * n_fp8_per_stream, device="cpu")
+    fp8_a = fp8_a.reshape(n_streams, n_fp8_per_stream)
+    fp8_b = fp8_b.reshape(n_streams, n_fp8_per_stream)
 
-    ca, sa, oa, sma, pf = encode(fp8_a, exp_freqs, tile=8)
-    cb, sb, ob, smb, _  = encode(fp8_b, exp_freqs, tile=8)
+    ca, sa, oa, pa, sma, pf, sp = tans_codec.encode(
+        fp8_a, exp_freqs, tile=TILE_PAIRS)
+    cb, sb, ob, pb, smb, _, _ = tans_codec.encode(
+        fp8_b, exp_freqs, tile=TILE_PAIRS)
+    decode_tbl = tans_codec.build_decode_table(sp.numpy(), pf.numpy())
+    args = [t.cuda() for t in (ca, oa, sa, pa, sma, cb, ob, sb, pb, smb, decode_tbl)]
 
-    pf_np = pf.numpy().astype(np.int32)
-    cumul = np.zeros(len(pf_np) + 1, dtype=np.int32)
-    cumul[1:] = np.cumsum(pf_np)
-    M = int(cumul[-1])
-    sfc = np.zeros(M, dtype=np.uint32)
-    for sym in range(len(pf_np)):
-        f = int(pf_np[sym])
-        c = int(cumul[sym])
-        for slot in range(c, c + f):
-            sfc[slot] = np.uint32(sym | (f << 8) | (c << 20))
-    sfc_t = torch.from_numpy(sfc.view(np.int32)).cuda()
-
-    ca_g, sa_g, oa_g, sma_g = ca.cuda(), sa.cuda(), oa.cuda(), sma.cuda()
-    cb_g, sb_g, ob_g, smb_g = cb.cuda(), sb.cuda(), ob.cuda(), smb.cuda()
-
-    torch.cuda.synchronize()
-    # warmups (skipped by --launch-skip)
     for _ in range(5):
-        fp8_vecadd_fused(ca_g, oa_g, sa_g, sma_g, cb_g, ob_g, sb_g, smb_g,
-                         sfc_t, N, 835)
+        fp8_vecadd_fused_tans(*args, n_fp8_per_stream)
     torch.cuda.synchronize()
-    # profiled launches
+
     for _ in range(3):
-        fp8_vecadd_fused(ca_g, oa_g, sa_g, sma_g, cb_g, ob_g, sb_g, smb_g,
-                         sfc_t, N, 835)
+        fp8_vecadd_fused_tans(*args, n_fp8_per_stream)
     torch.cuda.synchronize()
 
 
