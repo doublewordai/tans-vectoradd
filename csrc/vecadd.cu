@@ -1,8 +1,10 @@
 // Fused tANS decompress + FP8 vector add.
 //
-// This file intentionally contains one production path:
+// This file intentionally contains one production path plus one experimental
+// variant:
 //   - fp8_vecadd_raw: uncompressed FP8 baseline.
-//   - fp8_vecadd_fused_tans: the current best tANS fused kernel.
+//   - fp8_vecadd_fused_tans_register: the current best tANS fused kernel.
+//   - fp8_vecadd_fused_tans_shared: comparison path with shared symbol staging.
 //
 // The fused kernel decodes two compressed FP8 tensors, adds the decoded
 // values as E4M3, and writes the tiled output.  The tANS stream stores FP8
@@ -244,6 +246,113 @@ __global__ void fp8_vecadd_fused_tans_kernel(
     }
 }
 
+template <int kStreamsPerBlock>
+__global__ void fp8_vecadd_fused_tans_register_kernel(
+    const uint32_t* __restrict__ a_compressed,
+    const int32_t*  __restrict__ a_offsets,
+    const uint16_t* __restrict__ a_states,
+    const uint8_t*  __restrict__ a_partial,
+    const uint8_t*  __restrict__ a_sm_tiled,
+    const uint32_t* __restrict__ b_compressed,
+    const int32_t*  __restrict__ b_offsets,
+    const uint16_t* __restrict__ b_states,
+    const uint8_t*  __restrict__ b_partial,
+    const uint8_t*  __restrict__ b_sm_tiled,
+    const uint32_t* __restrict__ decode_tbl,
+    uint8_t*        __restrict__ output_tiled,
+    int64_t n_fp8_per_stream,
+    int64_t n_streams)
+{
+    extern __shared__ uint8_t smem_raw[];
+    uint32_t* tbl_smem = reinterpret_cast<uint32_t*>(smem_raw);
+
+    for (int i = threadIdx.x; i < kTansL; i += blockDim.x) {
+        tbl_smem[i] = decode_tbl[i];
+    }
+    __syncthreads();
+
+    int enc_group = threadIdx.x / kBlockStreams;
+    int tid = threadIdx.x % kBlockStreams;
+    int enc = kStreamsPerBlock * blockIdx.x + enc_group;
+    int sid = enc * kBlockStreams + tid;
+    bool active = sid < n_streams;
+
+    TansCtx ctx_a, ctx_b;
+    if (active) {
+        init_tans_ctx(ctx_a, a_offsets, a_states, a_partial, a_compressed,
+                      enc, sid, tid);
+        init_tans_ctx(ctx_b, b_offsets, b_states, b_partial, b_compressed,
+                      enc, sid, tid);
+    }
+
+    int64_t n_tiles = (n_fp8_per_stream / 2) / kTilePairs;
+
+    for (int64_t tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
+        if (active) {
+            uint8_t sym_a[kTilePairs];
+            uint8_t sym_b[kTilePairs];
+
+            int64_t sm_base = (tile_idx * n_streams + sid) * kTilePairs;
+            uint64_t sm_a =
+                *reinterpret_cast<const uint64_t*>(a_sm_tiled + sm_base);
+            uint64_t sm_b =
+                *reinterpret_cast<const uint64_t*>(b_sm_tiled + sm_base);
+
+            #pragma unroll
+            for (int t = 0; t < kTilePairs; t++) {
+                sym_a[t] = tans_step(ctx_a, a_compressed, tid, tbl_smem);
+                sym_b[t] = tans_step(ctx_b, b_compressed, tid, tbl_smem);
+            }
+
+            uint8_t out_buf[kTilePairs * 2];
+
+            #pragma unroll
+            for (int t = 0; t < kTilePairs; t++) {
+                uint8_t sm_a_val = (uint8_t)(sm_a >> (t * 8));
+                uint8_t sm_b_val = (uint8_t)(sm_b >> (t * 8));
+
+                uint8_t a0 = compose_fp8_byte(sym_a[t] >> 4, sm_a_val & 0xFu);
+                uint8_t a1 = compose_fp8_byte(sym_a[t] & 0xFu, sm_a_val >> 4);
+                uint8_t b0 = compose_fp8_byte(sym_b[t] >> 4, sm_b_val & 0xFu);
+                uint8_t b1 = compose_fp8_byte(sym_b[t] & 0xFu, sm_b_val >> 4);
+
+                out_buf[t * 2] = add_fp8_bytes(a0, b0);
+                out_buf[t * 2 + 1] = add_fp8_bytes(a1, b1);
+            }
+
+            int64_t out_base = (tile_idx * n_streams + sid) * (kTilePairs * 2);
+            *reinterpret_cast<uint4*>(output_tiled + out_base) =
+                *reinterpret_cast<const uint4*>(out_buf);
+        }
+    }
+}
+
+enum class FusedTansVariant {
+    Shared,
+    Register,
+};
+
+FusedTansVariant fused_tans_variant_from_env() {
+    const char* value = std::getenv("TANS_FUSED_VARIANT");
+    if (value == nullptr || value[0] == '\0') {
+        return FusedTansVariant::Register;
+    }
+    if (std::strcmp(value, "shared") == 0
+        || std::strcmp(value, "current") == 0
+        || std::strcmp(value, "smem") == 0) {
+        return FusedTansVariant::Shared;
+    }
+    if (std::strcmp(value, "register") == 0
+        || std::strcmp(value, "registers") == 0
+        || std::strcmp(value, "reg") == 0) {
+        return FusedTansVariant::Register;
+    }
+    TORCH_CHECK(false,
+                "TANS_FUSED_VARIANT must be shared/current/smem or "
+                "register/registers/reg");
+    return FusedTansVariant::Register;
+}
+
 int streams_per_block_from_env() {
     const char* value = std::getenv("TANS_STREAMS_PER_BLOCK");
     if (value == nullptr || value[0] == '\0') {
@@ -289,13 +398,14 @@ torch::Tensor fp8_vecadd_raw(torch::Tensor A, torch::Tensor B) {
     return C;
 }
 
-torch::Tensor fp8_vecadd_fused_tans(
+torch::Tensor fp8_vecadd_fused_tans_impl(
     torch::Tensor a_comp, torch::Tensor a_offsets, torch::Tensor a_states,
     torch::Tensor a_partial, torch::Tensor a_sm,
     torch::Tensor b_comp, torch::Tensor b_offsets, torch::Tensor b_states,
     torch::Tensor b_partial, torch::Tensor b_sm,
     torch::Tensor decode_tbl,
-    int64_t n_fp8_per_stream)
+    int64_t n_fp8_per_stream,
+    FusedTansVariant variant)
 {
     check_u8_cuda_contiguous("a_comp", a_comp);
     check_u8_cuda_contiguous("a_partial", a_partial);
@@ -346,27 +456,53 @@ torch::Tensor fp8_vecadd_fused_tans(
 
 #define LAUNCH_FUSED_TANS(SPB)                                                \
     do {                                                                       \
-        C10_CUDA_CHECK(cudaFuncSetCacheConfig(                                 \
-            fp8_vecadd_fused_tans_kernel<SPB>,                                 \
-            cudaFuncCachePreferL1));                                           \
         int64_t blocks = (n_enc_blocks + (SPB) - 1) / (SPB);                   \
         int threads = kBlockStreams * (SPB);                                   \
-        int smem_bytes = kTansL * 4 + 2 * kTilePairs * threads;                \
-        fp8_vecadd_fused_tans_kernel<SPB><<<blocks, threads, smem_bytes>>>(    \
-            reinterpret_cast<const uint32_t*>(a_comp.data_ptr<uint8_t>()),     \
-            a_offsets.data_ptr<int32_t>(),                                     \
-            a_states.data_ptr<uint16_t>(),                                     \
-            a_partial.data_ptr<uint8_t>(),                                     \
-            a_sm.data_ptr<uint8_t>(),                                          \
-            reinterpret_cast<const uint32_t*>(b_comp.data_ptr<uint8_t>()),     \
-            b_offsets.data_ptr<int32_t>(),                                     \
-            b_states.data_ptr<uint16_t>(),                                     \
-            b_partial.data_ptr<uint8_t>(),                                     \
-            b_sm.data_ptr<uint8_t>(),                                          \
-            reinterpret_cast<const uint32_t*>(decode_tbl.data_ptr<int32_t>()), \
-            output.data_ptr<uint8_t>(),                                        \
-            n_fp8_per_stream,                                                  \
-            n_streams);                                                        \
+        if (variant == FusedTansVariant::Shared) {                             \
+            C10_CUDA_CHECK(cudaFuncSetCacheConfig(                             \
+                fp8_vecadd_fused_tans_kernel<SPB>,                             \
+                cudaFuncCachePreferL1));                                       \
+            int smem_bytes = kTansL * 4 + 2 * kTilePairs * threads;            \
+            fp8_vecadd_fused_tans_kernel<SPB><<<                               \
+                blocks, threads, smem_bytes>>>(                                \
+                reinterpret_cast<const uint32_t*>(a_comp.data_ptr<uint8_t>()), \
+                a_offsets.data_ptr<int32_t>(),                                 \
+                a_states.data_ptr<uint16_t>(),                                 \
+                a_partial.data_ptr<uint8_t>(),                                 \
+                a_sm.data_ptr<uint8_t>(),                                      \
+                reinterpret_cast<const uint32_t*>(b_comp.data_ptr<uint8_t>()), \
+                b_offsets.data_ptr<int32_t>(),                                 \
+                b_states.data_ptr<uint16_t>(),                                 \
+                b_partial.data_ptr<uint8_t>(),                                 \
+                b_sm.data_ptr<uint8_t>(),                                      \
+                reinterpret_cast<const uint32_t*>(                             \
+                    decode_tbl.data_ptr<int32_t>()),                           \
+                output.data_ptr<uint8_t>(),                                    \
+                n_fp8_per_stream,                                              \
+                n_streams);                                                    \
+        } else {                                                               \
+            C10_CUDA_CHECK(cudaFuncSetCacheConfig(                             \
+                fp8_vecadd_fused_tans_register_kernel<SPB>,                    \
+                cudaFuncCachePreferL1));                                       \
+            int smem_bytes = kTansL * 4;                                       \
+            fp8_vecadd_fused_tans_register_kernel<SPB><<<                      \
+                blocks, threads, smem_bytes>>>(                                \
+                reinterpret_cast<const uint32_t*>(a_comp.data_ptr<uint8_t>()), \
+                a_offsets.data_ptr<int32_t>(),                                 \
+                a_states.data_ptr<uint16_t>(),                                 \
+                a_partial.data_ptr<uint8_t>(),                                 \
+                a_sm.data_ptr<uint8_t>(),                                      \
+                reinterpret_cast<const uint32_t*>(b_comp.data_ptr<uint8_t>()), \
+                b_offsets.data_ptr<int32_t>(),                                 \
+                b_states.data_ptr<uint16_t>(),                                 \
+                b_partial.data_ptr<uint8_t>(),                                 \
+                b_sm.data_ptr<uint8_t>(),                                      \
+                reinterpret_cast<const uint32_t*>(                             \
+                    decode_tbl.data_ptr<int32_t>()),                           \
+                output.data_ptr<uint8_t>(),                                    \
+                n_fp8_per_stream,                                              \
+                n_streams);                                                    \
+        }                                                                      \
     } while (0)
 
     switch (streams_per_block) {
@@ -390,4 +526,46 @@ torch::Tensor fp8_vecadd_fused_tans(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+torch::Tensor fp8_vecadd_fused_tans(
+    torch::Tensor a_comp, torch::Tensor a_offsets, torch::Tensor a_states,
+    torch::Tensor a_partial, torch::Tensor a_sm,
+    torch::Tensor b_comp, torch::Tensor b_offsets, torch::Tensor b_states,
+    torch::Tensor b_partial, torch::Tensor b_sm,
+    torch::Tensor decode_tbl,
+    int64_t n_fp8_per_stream)
+{
+    return fp8_vecadd_fused_tans_impl(
+        a_comp, a_offsets, a_states, a_partial, a_sm,
+        b_comp, b_offsets, b_states, b_partial, b_sm,
+        decode_tbl, n_fp8_per_stream, fused_tans_variant_from_env());
+}
+
+torch::Tensor fp8_vecadd_fused_tans_shared(
+    torch::Tensor a_comp, torch::Tensor a_offsets, torch::Tensor a_states,
+    torch::Tensor a_partial, torch::Tensor a_sm,
+    torch::Tensor b_comp, torch::Tensor b_offsets, torch::Tensor b_states,
+    torch::Tensor b_partial, torch::Tensor b_sm,
+    torch::Tensor decode_tbl,
+    int64_t n_fp8_per_stream)
+{
+    return fp8_vecadd_fused_tans_impl(
+        a_comp, a_offsets, a_states, a_partial, a_sm,
+        b_comp, b_offsets, b_states, b_partial, b_sm,
+        decode_tbl, n_fp8_per_stream, FusedTansVariant::Shared);
+}
+
+torch::Tensor fp8_vecadd_fused_tans_register(
+    torch::Tensor a_comp, torch::Tensor a_offsets, torch::Tensor a_states,
+    torch::Tensor a_partial, torch::Tensor a_sm,
+    torch::Tensor b_comp, torch::Tensor b_offsets, torch::Tensor b_states,
+    torch::Tensor b_partial, torch::Tensor b_sm,
+    torch::Tensor decode_tbl,
+    int64_t n_fp8_per_stream)
+{
+    return fp8_vecadd_fused_tans_impl(
+        a_comp, a_offsets, a_states, a_partial, a_sm,
+        b_comp, b_offsets, b_states, b_partial, b_sm,
+        decode_tbl, n_fp8_per_stream, FusedTansVariant::Register);
 }

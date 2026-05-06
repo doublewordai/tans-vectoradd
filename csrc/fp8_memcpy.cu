@@ -18,6 +18,16 @@ torch::Tensor fp8_vecadd_fused_tans(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, int64_t);
 
+torch::Tensor fp8_vecadd_fused_tans_shared(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, int64_t);
+
+torch::Tensor fp8_vecadd_fused_tans_register(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, int64_t);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("tans_encode_interleaved", &tans_encode_interleaved,
           "CPU tANS encoder -> GPU-ready interleaved slab layout.");
@@ -26,5 +36,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_vecadd_raw", &fp8_vecadd_raw,
           "Uncompressed FP8 vector add: C[i] = A[i] + B[i].");
     m.def("fp8_vecadd_fused_tans", &fp8_vecadd_fused_tans,
-          "Fused tANS decompress + FP8 vector add from compressed A and B.");
+          "Fused tANS decompress + FP8 vector add selected by env.");
+    m.def("fp8_vecadd_fused_tans_shared", &fp8_vecadd_fused_tans_shared,
+          "Fused tANS vecadd with shared-memory decoded symbol staging.");
+    m.def("fp8_vecadd_fused_tans_register", &fp8_vecadd_fused_tans_register,
+          "Fused tANS vecadd with register decoded symbol staging.");
 }

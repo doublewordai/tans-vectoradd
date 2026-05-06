@@ -12,12 +12,12 @@ test:
 bench:
     CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} {{py}} bench_vecadd.py
 
-profile N="1024":
+profile N="1024" VARIANT="register":
     sudo -n env PATH=$PATH CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
         ncu --target-processes all \
         --kernel-name regex:fp8_vecadd_fused_tans \
         --launch-skip 5 --launch-count 3 \
         --set detailed \
-        $(pwd)/{{py}} profile_vecadd.py {{N}}
+        $(pwd)/{{py}} profile_vecadd.py {{N}} --variant {{VARIANT}}
 
 iterate: build test bench

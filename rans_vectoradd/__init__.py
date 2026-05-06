@@ -1,5 +1,7 @@
 from rans_vectoradd._C import (
     fp8_vecadd_fused_tans,
+    fp8_vecadd_fused_tans_register,
+    fp8_vecadd_fused_tans_shared,
     fp8_vecadd_raw,
     gpu_tans_decode,
 )
@@ -9,6 +11,8 @@ from . import tans_codec
 __all__ = [
     "QWEN3_14B_FP8_EXP",
     "fp8_vecadd_fused_tans",
+    "fp8_vecadd_fused_tans_register",
+    "fp8_vecadd_fused_tans_shared",
     "fp8_vecadd_raw",
     "gpu_tans_decode",
     "random_fp8_bytes",

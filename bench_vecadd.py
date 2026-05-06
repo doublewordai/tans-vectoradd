@@ -9,7 +9,8 @@ import triton.testing
 
 from rans_vectoradd import (
     QWEN3_14B_FP8_EXP,
-    fp8_vecadd_fused_tans,
+    fp8_vecadd_fused_tans_register,
+    fp8_vecadd_fused_tans_shared,
     fp8_vecadd_raw,
     random_fp8_bytes,
     tans_codec,
@@ -71,6 +72,7 @@ def prepare_fused_inputs(
 
 
 def bench_fused(
+    fn,
     kernel_args: list[torch.Tensor],
     n_fp8_per_stream: int,
     hbm_bytes: int,
@@ -78,7 +80,7 @@ def bench_fused(
     streams_per_block: int,
 ) -> dict[str, float]:
     os.environ["TANS_STREAMS_PER_BLOCK"] = str(streams_per_block)
-    ms = bench(lambda: fp8_vecadd_fused_tans(*kernel_args, n_fp8_per_stream))
+    ms = bench(lambda: fn(*kernel_args, n_fp8_per_stream))
     seconds = ms / 1000.0
 
     return {
@@ -106,6 +108,12 @@ def parse_args() -> argparse.Namespace:
         default=[8],
         help="Fused-kernel encoder-blocks per CTA variants.",
     )
+    parser.add_argument(
+        "--variant",
+        choices=["shared", "register", "both"],
+        default="both",
+        help="Fused kernel staging variant to benchmark.",
+    )
     return parser.parse_args()
 
 
@@ -120,23 +128,32 @@ def main() -> None:
             continue
         kernel_args, hbm_bytes, bits_per_fp8 = prepare_fused_inputs(
             n_bytes, n_fp8_per_stream)
-        for streams_per_block in args.streams_per_block:
-            fused = bench_fused(
-                kernel_args,
-                n_fp8_per_stream,
-                hbm_bytes,
-                bits_per_fp8,
-                streams_per_block,
-            )
-            print(
-                f"spb={streams_per_block:<2}  "
-                f"N={n_fp8_per_stream:>5}  "
-                f"{fused['ms']:.3f} ms  "
-                f"{raw['ms'] / fused['ms']:.3f}x raw  "
-                f"{fused['gb_s']:.1f} effective GB/s  "
-                f"{fused['bits_per_fp8']:.3f} compressed bits/fp8",
-                flush=True,
-            )
+        variants = []
+        if args.variant in ("shared", "both"):
+            variants.append(("shared", fp8_vecadd_fused_tans_shared))
+        if args.variant in ("register", "both"):
+            variants.append(("register", fp8_vecadd_fused_tans_register))
+
+        for variant_name, fn in variants:
+            for streams_per_block in args.streams_per_block:
+                fused = bench_fused(
+                    fn,
+                    kernel_args,
+                    n_fp8_per_stream,
+                    hbm_bytes,
+                    bits_per_fp8,
+                    streams_per_block,
+                )
+                print(
+                    f"{variant_name:<8}  "
+                    f"spb={streams_per_block:<2}  "
+                    f"N={n_fp8_per_stream:>5}  "
+                    f"{fused['ms']:.3f} ms  "
+                    f"{raw['ms'] / fused['ms']:.3f}x raw  "
+                    f"{fused['gb_s']:.1f} effective GB/s  "
+                    f"{fused['bits_per_fp8']:.3f} compressed bits/fp8",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":
