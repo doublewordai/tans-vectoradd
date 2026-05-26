@@ -32,8 +32,13 @@ at a sweep of stream lengths; the headline number is the `× raw` column.
 
 ## File map
 
-- `csrc/vecadd.cu` — `fp8_vecadd_raw_kernel` (baseline) and
-  `fp8_vecadd_fused_tans_register_kernel` (fused decode-and-add).
+- `csrc/vecadd.cu` — the kernels. `fp8_vecadd_raw_kernel` is the
+  uncompressed baseline. There are two fused variants:
+  `fp8_vecadd_fused_tans_shared_kernel` (shared-memory symbol staging) and
+  `fp8_vecadd_fused_tans_register_kernel` (register-resident staging). On
+  the 4090, `shared` is the one that hits the 1.10× number quoted above;
+  `register` was being tuned for GH200 when this branch settled and is
+  slightly off-pace at 4090 shape.
 - `csrc/tans_codec.cpp` — CPU-side tANS encoder into the GPU slab layout.
 - `csrc/tans_decode.cu` — standalone GPU tANS decoder, exercised by the
   round-trip test.
