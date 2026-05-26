@@ -49,23 +49,6 @@ at a sweep of stream lengths; the headline number is the `× raw` column.
 - `bench_vecadd.py` — local benchmark sweep.
 - `profile_vecadd.py` — minimal Nsight Compute driver.
 
-## Experimental branches
-
-The result on this branch (`main`) is the clean 4090 path described in
-the blog post. The companion branches hold work that didn't make the
-cut for the post:
-
-- `experiments` — GH200 / Hopper tuning of the same kernel family, with
-  decode-table layout variants and bit-buffer-state-index alternatives.
-- `hopper-bw-ceiling` — deeper Hopper exploration including alternative
-  coders (Huffman, pair-Huffman, Tunstall, hybrid), warp-split kernel
-  designs, and ~60 NCU-driven micro-variants. None of the variants
-  crossed the amplification line on Hopper at FP8 vector-add shape;
-  the branch is preserved as a record of what was tried.
-
-These branches will lag main as a deliberate snapshot of the work
-described in the *Outlook: bigger GPUs* section of the blog post.
-
 ## License
 
 MIT, see [LICENSE](LICENSE).
