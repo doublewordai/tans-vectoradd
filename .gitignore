@@ -1,0 +1,24 @@
+__pycache__/
+exp/
+*.so
+*.pyc
+build/
+dist/
+*.egg-info/
+.venv/
+
+# Local AI session traces
+.claude/
+.codex/
+
+# Nsight Compute profile dumps
+*.ncu-rep
+ncu_*/
+
+# Compiler dumps
+*.ptx
+*.sass
+
+# Ad-hoc edit/revert safety copies
+*.bak
+*.new

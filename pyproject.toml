@@ -1,0 +1,19 @@
+[project]
+name = "rans-vectoradd"
+version = "0.0.1"
+description = "tANS-compressed FP8 vector add: bandwidth-bound kernel harness"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "triton>=3.0",
+    "numpy",
+    "safetensors",
+    "packaging>=26.1",
+]
+
+[build-system]
+requires = ["setuptools>=64", "torch>=2.1"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rans_vectoradd*"]
