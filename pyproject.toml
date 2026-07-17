@@ -4,7 +4,7 @@ version = "0.0.1"
 description = "tANS-compressed FP8 vector add: bandwidth-bound kernel harness"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.1",
+    "torch>=2.13.0",
     "triton>=3.0",
     "numpy",
     "safetensors",
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["setuptools>=64", "torch>=2.1"]
+requires = ["setuptools>=64", "torch>=2.13.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
